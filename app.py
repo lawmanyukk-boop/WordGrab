@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""录音转文字 · 桌面 GUI（pywebview）
+"""WordGrab · 桌面 GUI（pywebview）
 飞书妙记风：左侧历史 + 文稿点读联动 + 播放器 + 说话人改名 + 搜索 + 导出
 """
 import os, sys, json, time, uuid, shutil, threading, datetime, re
@@ -409,7 +409,7 @@ def main():
     api.port = port
     threading.Thread(target=_preload_model, daemon=True).start()
     window = webview.create_window(
-        "录音转文字", url=f"http://127.0.0.1:{port}/",
+        "WordGrab", url=f"http://127.0.0.1:{port}/",
         js_api=api,
         width=1120, height=740, min_size=(900, 600),
         background_color="#F5F7FB",

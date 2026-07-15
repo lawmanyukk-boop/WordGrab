@@ -3,7 +3,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP_DIR="${1:-$PROJECT_ROOT/录音转文字.app}"
+APP_DIR="${1:-$PROJECT_ROOT/WordGrab.app}"
 CONTENTS_DIR="$APP_DIR/Contents"
 
 if [[ ! -f "$PROJECT_ROOT/app.py" ]]; then
@@ -25,15 +25,15 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleDisplayName</key>
-    <string>录音转文字</string>
+    <string>WordGrab</string>
     <key>CFBundleExecutable</key>
     <string>launcher</string>
     <key>CFBundleIconFile</key>
     <string>icon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.local.voicetotext</string>
+    <string>com.local.wordgrab</string>
     <key>CFBundleName</key>
-    <string>录音转文字</string>
+    <string>WordGrab</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
