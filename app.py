@@ -401,18 +401,29 @@ def _preload_model():
 
 
 def _set_dock_icon():
-    # 直接用 python 跑时进程会显示 Python 的火箭图标，这里换成本应用的
+    # 直接用 python 跑时进程会显示 Python 的火箭图标，这里换成本应用的。
+    # 必须等主运行循环启动后再设，否则 app 完成启动时会被重置回火箭。
     try:
         import AppKit
-        for p in (os.path.join(HERE, "assets", "icon.icns"),
-                  os.path.join(HERE, "icon.icns")):
-            if os.path.exists(p):
-                img = AppKit.NSImage.alloc().initWithContentsOfFile_(p)
-                if img:
-                    AppKit.NSApplication.sharedApplication().setApplicationIconImage_(img)
-                break
-    except Exception:
-        pass
+        from Foundation import NSOperationQueue
+        path = next((p for p in (os.path.join(HERE, "assets", "icon.icns"),
+                                 os.path.join(HERE, "icon.icns"))
+                     if os.path.exists(p)), None)
+        if not path:
+            print("[dock] 未找到 icon.icns，跳过", flush=True)
+            return
+
+        def apply():
+            img = AppKit.NSImage.alloc().initWithContentsOfFile_(path)
+            if img:
+                AppKit.NSApplication.sharedApplication().setApplicationIconImage_(img)
+                print("[dock] Dock 图标已设置", flush=True)
+            else:
+                print("[dock] icns 加载失败", flush=True)
+
+        NSOperationQueue.mainQueue().addOperationWithBlock_(apply)
+    except Exception as e:
+        print(f"[dock] 设置图标失败: {e!r}", flush=True)
 
 
 def main():
@@ -431,6 +442,7 @@ def main():
         background_color="#F5F7FB",
     )
     api.window = window
+    window.events.shown += _set_dock_icon
     webview.start(debug=("--debug" in sys.argv))
 
 
