@@ -400,11 +400,27 @@ def _preload_model():
         print(f"[preload] 模型加载失败（转写时会重试）: {e!r}", flush=True)
 
 
+def _set_dock_icon():
+    # 直接用 python 跑时进程会显示 Python 的火箭图标，这里换成本应用的
+    try:
+        import AppKit
+        for p in (os.path.join(HERE, "assets", "icon.icns"),
+                  os.path.join(HERE, "icon.icns")):
+            if os.path.exists(p):
+                img = AppKit.NSImage.alloc().initWithContentsOfFile_(p)
+                if img:
+                    AppKit.NSApplication.sharedApplication().setApplicationIconImage_(img)
+                break
+    except Exception:
+        pass
+
+
 def main():
     global API_REF
     import webview
     api = Api()
     API_REF = api
+    _set_dock_icon()
     port = start_server()
     api.port = port
     threading.Thread(target=_preload_model, daemon=True).start()
