@@ -50,12 +50,42 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# PROJECT_ROOT 在生成时展开为这台机器上的实际项目路径；其余变量留给 App 启动时解析。
+# 尝试把 Python 解释器复制进 bundle：进程可执行文件位于 .app 内，
+# macOS 才会把运行中的进程认作本应用（否则 Dock 显示 Python 的火箭图标和名字）。
+BUNDLED_BIN=""
+VENV_PY="$PROJECT_ROOT/.venv/bin/python"
+if [[ -x "$VENV_PY" ]]; then
+  BASE="$("$VENV_PY" -c 'import sys; print(sys.base_exec_prefix)' 2>/dev/null || true)"
+  REAL="$BASE/Resources/Python.app/Contents/MacOS/Python"   # framework 构建的真实解释器
+  if [[ -f "$REAL" && -f "$BASE/Python3" ]]; then
+    cp "$REAL" "$CONTENTS_DIR/MacOS/WordGrab-bin"
+    # 二进制里的 Python3 动态库是相对引用，拷出后改成绝对路径并临时签名
+    OLD_REF="$(otool -L "$CONTENTS_DIR/MacOS/WordGrab-bin" | awk '/@executable_path.*Python3/{print $1; exit}')"
+    if [[ -n "$OLD_REF" ]]; then
+      install_name_tool -change "$OLD_REF" "$BASE/Python3" "$CONTENTS_DIR/MacOS/WordGrab-bin" 2>/dev/null
+    fi
+    codesign -f -s - "$CONTENTS_DIR/MacOS/WordGrab-bin" 2>/dev/null
+    chmod +x "$CONTENTS_DIR/MacOS/WordGrab-bin"
+    BUNDLED_BIN=1
+    echo "已内嵌解释器（Dock 图标/名字将显示为本应用）"
+  fi
+fi
+SITE_PACKAGES="$(ls -d "$PROJECT_ROOT"/.venv/lib/python*/site-packages 2>/dev/null | head -1)"
+
+# PROJECT_ROOT / SITE_PACKAGES 在生成时展开；其余变量留给 App 启动时解析。
 cat > "$CONTENTS_DIR/MacOS/launcher" <<LAUNCHER
 #!/usr/bin/env bash
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
 PROJECT_ROOT="$PROJECT_ROOT"
 cd "\$PROJECT_ROOT" || exit 1
 export MODELSCOPE_CACHE="\$HOME/.cache/modelscope"
+mkdir -p "\$PROJECT_ROOT/data"
+
+# 优先用 bundle 内嵌解释器（进程身份=本应用，Dock 图标才正确）
+if [[ -x "\$DIR/WordGrab-bin" ]]; then
+  export PYTHONPATH="$SITE_PACKAGES"
+  exec /usr/bin/arch -arm64 "\$DIR/WordGrab-bin" "\$PROJECT_ROOT/app.py" >> "\$PROJECT_ROOT/data/app.log" 2>&1
+fi
 
 PYTHON="\$PROJECT_ROOT/.venv/bin/python"
 if [[ ! -x "\$PYTHON" ]]; then
@@ -66,7 +96,6 @@ if [[ -z "\$PYTHON" ]]; then
   exit 1
 fi
 
-mkdir -p "\$PROJECT_ROOT/data"
 # 强制以原生 arm64 运行，避免 Finder 经 Rosetta 启动时加载 arm64 PyTorch 失败。
 exec /usr/bin/arch -arm64 "\$PYTHON" "\$PROJECT_ROOT/app.py" >> "\$PROJECT_ROOT/data/app.log" 2>&1
 LAUNCHER
