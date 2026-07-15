@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+data/
+*.log
+.DS_Store
+bin/
+录音转文字.app/
+dist/
+*.icns.tmp
