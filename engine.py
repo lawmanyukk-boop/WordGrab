@@ -13,18 +13,30 @@ import os, subprocess, tempfile, json, threading, shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+_FFMPEG = None  # 缓存解析结果；惰性解析，避免 import 时缺 ffmpeg 直接崩掉整个 App
+
+
 def _resolve_ffmpeg():
-    """按环境变量、系统 PATH、本地旧版目录的顺序定位 ffmpeg。"""
+    """按环境变量、系统 PATH、本地旧版目录的顺序定位 ffmpeg（结果缓存）。
+    惰性调用：只有真正要用 ffmpeg 时才解析，缺失时抛出可读错误，
+    而不是在 import engine 阶段就让 GUI/CLI 崩溃。"""
+    global _FFMPEG
+    if _FFMPEG is not None:
+        return _FFMPEG
+
     if os.environ.get("FFMPEG_PATH"):
-        return os.environ["FFMPEG_PATH"]
+        _FFMPEG = os.environ["FFMPEG_PATH"]
+        return _FFMPEG
 
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
-        return system_ffmpeg
+        _FFMPEG = system_ffmpeg
+        return _FFMPEG
 
     bundled_ffmpeg = os.path.join(HERE, "bin", "ffmpeg")
     if os.path.isfile(bundled_ffmpeg) and os.access(bundled_ffmpeg, os.X_OK):
-        return bundled_ffmpeg
+        _FFMPEG = bundled_ffmpeg
+        return _FFMPEG
 
     raise RuntimeError(
         "未找到 ffmpeg。请先安装：brew install ffmpeg；"
@@ -32,7 +44,6 @@ def _resolve_ffmpeg():
     )
 
 
-FFMPEG = _resolve_ffmpeg()
 os.environ.setdefault("MODELSCOPE_CACHE", os.path.expanduser("~/.cache/modelscope"))
 
 _MODEL = None
@@ -65,7 +76,7 @@ def probe_duration(path):
     """秒（float）"""
     try:
         out = subprocess.run(
-            [FFMPEG, "-i", path], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL
+            [_resolve_ffmpeg(), "-i", path], stderr=subprocess.PIPE, stdout=subprocess.DEVNULL
         ).stderr.decode("utf-8", "ignore")
         import re
         m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", out)
@@ -83,7 +94,7 @@ def to_wav16k(src):
     os.close(fd)
     af = "highpass=f=100,loudnorm=I=-16:TP=-1.5:LRA=11"
     subprocess.run(
-        [FFMPEG, "-y", "-i", src, "-af", af, "-ar", "16000", "-ac", "1", "-vn", wav],
+        [_resolve_ffmpeg(), "-y", "-i", src, "-af", af, "-ar", "16000", "-ac", "1", "-vn", wav],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     return wav
