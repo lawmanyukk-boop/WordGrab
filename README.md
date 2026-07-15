@@ -1,4 +1,4 @@
-# 录音转文字
+# WordGrab
 
 本地离线中文语音转写工具，支持说话人分离；音频始终留在本机，适合重视隐私的录音整理场景。
 
@@ -40,7 +40,7 @@ python3 -m venv .venv
 bash scripts/make_app.sh
 ```
 
-脚本会在项目根目录生成 `录音转文字.app`。双击它可启动桌面 GUI；该 App 会优先使用项目内的 `.venv`，没有时回退到系统的 `python3`。
+脚本会在项目根目录生成 `WordGrab.app`。双击它可启动桌面 GUI；该 App 会优先使用项目内的 `.venv`，没有时回退到系统的 `python3`。
 
 ## 精度 Tips
 

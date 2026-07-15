@@ -6,6 +6,7 @@ data/
 *.log
 .DS_Store
 bin/
+WordGrab.app/
 录音转文字.app/
 dist/
 *.icns.tmp
