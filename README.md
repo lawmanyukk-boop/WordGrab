@@ -2,7 +2,7 @@
 
 本地离线中文语音转写工具，支持说话人分离；音频始终留在本机，适合重视隐私的录音整理场景。
 
-**A private, offline Chinese speech-to-text app with speaker diarization for macOS.**
+**A private, offline Chinese speech-to-text app with speaker diarization for macOS and Windows.**
 
 ## 功能特性
 
@@ -14,13 +14,15 @@
 
 ## 环境要求
 
-- macOS；推荐 Apple Silicon，以使用 MPS 加速。
-- Python >= 3.9。
-- ffmpeg：`brew install ffmpeg`。
-
-当前第一版仅支持 macOS。
+- **macOS** 或 **Windows 10/11**
+- Python >= 3.9
+- ffmpeg（可选，程序会自动使用内置的 imageio-ffmpeg）
+  - macOS: `brew install ffmpeg`
+  - Windows: 程序会自动处理，无需手动安装
 
 ## Quick Start
+
+### macOS
 
 ```bash
 git clone https://github.com/lawmanyukk-boop/WordGrab.git
@@ -31,11 +33,25 @@ python3 -m venv .venv
 .venv/bin/python transcribe.py 录音.m4a   # CLI
 ```
 
+### Windows
+
+```bash
+git clone https://github.com/lawmanyukk-boop/WordGrab.git
+cd WordGrab
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python app.py                  # GUI
+python transcribe.py 录音.m4a  # CLI
+```
+
 ## 首次运行
 
 首次转写会自动通过 ModelScope 下载所需模型（约 2GB）到 `~/.cache/modelscope`。模型下载完成后，推理和音频处理都在本机完成，音频不会上传。
 
-## 生成拖拽 App（可选）
+## 打包（可选）
+
+### macOS App
 
 ```bash
 bash scripts/make_app.sh
@@ -48,6 +64,20 @@ bash scripts/make_app.sh /Applications/WordGrab.app
 ```
 
 脚本会把最新版源代码同步到 `~/Library/Application Support/录音转文字`。桌面 App 优先使用该目录中的 `.venv`，没有时回退到系统的 `python3`。开发调试建议直接运行项目目录中的 `.venv/bin/python app.py`。
+
+### Windows 可执行文件
+
+```bash
+# 先安装 PyInstaller
+pip install pyinstaller
+
+# 执行打包（首次会比较慢，需要分析所有依赖）
+pyinstaller WordGrab.spec
+```
+
+打包完成后，可执行文件位于 `dist\WordGrab\WordGrab.exe`。首次运行会自动下载 AI 模型（约 2 GB，需联网）。
+
+**注意**：Windows Defender 可能会误报打包后的 exe 文件，这是 PyInstaller 打包工具的常见现象，允许运行即可。
 
 ## 本地数据与隐私
 

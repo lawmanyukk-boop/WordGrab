@@ -1978,28 +1978,41 @@ def _install_native_drag_strip(window):
 def main():
     global API_REF
     import webview
+
+    IS_MACOS = sys.platform == "darwin"
+
     api = Api()
     API_REF = api
-    _set_dock_icon()
+
+    # Dock 图标设置只在 macOS 执行
+    if IS_MACOS:
+        _set_dock_icon()
+
     port = start_server()
     api.port = port
     threading.Thread(target=_preload_model, daemon=True).start()
+
+    # macOS：无边框窗口 + 原生标题栏美化
+    # Windows：普通窗口（自带标题栏、关闭按钮、拖动功能）
     window = webview.create_window(
         "WordGrab", url=f"http://127.0.0.1:{port}/",
         js_api=api,
         width=1120, height=740, min_size=(800, 600),
         background_color="#FFFFFF",
-        # 让 pywebview 在创建 NSWindow 时就启用 full-size content view；
-        # before_show 回调会重新显示原生红黄绿按钮。
-        frameless=True, easy_drag=False,
+        frameless=IS_MACOS,  # 只在 macOS 无边框
+        easy_drag=False,
     )
     api.window = window
-    window.events.before_show += _integrate_native_titlebar
-    window.events.loaded += _install_native_drag_strip
-    # loaded 之后 WebView 还会继续完成原生布局；shown 阶段再安装一次，
-    # 避免首次打开必须先调整窗口高度才能触发拖动带。
-    window.events.shown += _install_native_drag_strip
-    window.events.shown += _set_dock_icon
+
+    # macOS 专属窗口美化（一体式标题栏、自定义拖动条）
+    if IS_MACOS:
+        window.events.before_show += _integrate_native_titlebar
+        window.events.loaded += _install_native_drag_strip
+        # loaded 之后 WebView 还会继续完成原生布局；shown 阶段再安装一次，
+        # 避免首次打开必须先调整窗口高度才能触发拖动带。
+        window.events.shown += _install_native_drag_strip
+        window.events.shown += _set_dock_icon
+
     webview.start(debug=("--debug" in sys.argv))
 
 
