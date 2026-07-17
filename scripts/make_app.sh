@@ -70,24 +70,26 @@ if [[ -x "$VENV_PY" ]]; then
     echo "已内嵌解释器（Dock 图标/名字将显示为本应用）"
   fi
 fi
-SITE_PACKAGES="$(ls -d "$PROJECT_ROOT"/.venv/lib/python*/site-packages 2>/dev/null | head -1)"
+SITE_PACKAGES="$(ls -d "$PROJECT_ROOT"/.venv/lib/python*/site-packages 2>/dev/null | head -1 || true)"
 
-# PROJECT_ROOT / SITE_PACKAGES 在生成时展开；其余变量留给 App 启动时解析。
+# App 源码放在 Application Support，避免 macOS 对桌面目录的应用访问限制。
+RUNTIME_ROOT="$HOME/Library/Application Support/录音转文字"
+mkdir -p "$RUNTIME_ROOT/ui" "$RUNTIME_ROOT/assets"
+cp "$PROJECT_ROOT/app.py" "$PROJECT_ROOT/engine.py" "$PROJECT_ROOT/transcribe.py" "$PROJECT_ROOT/requirements.txt" "$PROJECT_ROOT/README.md" "$RUNTIME_ROOT/"
+cp -R "$PROJECT_ROOT/ui/." "$RUNTIME_ROOT/ui/"
+cp -R "$PROJECT_ROOT/assets/." "$RUNTIME_ROOT/assets/"
+
+# RUNTIME_ROOT / SITE_PACKAGES 在生成时展开；其余变量留给 App 启动时解析。
 cat > "$CONTENTS_DIR/MacOS/launcher" <<LAUNCHER
 #!/usr/bin/env bash
 DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-PROJECT_ROOT="$PROJECT_ROOT"
+PROJECT_ROOT="\$HOME/Library/Application Support/录音转文字"
 cd "\$PROJECT_ROOT" || exit 1
 export MODELSCOPE_CACHE="\$HOME/.cache/modelscope"
 mkdir -p "\$PROJECT_ROOT/data"
 
-# 优先用 bundle 内嵌解释器（进程身份=本应用，Dock 图标才正确）
-if [[ -x "\$DIR/WordGrab-bin" ]]; then
-  export PYTHONPATH="$SITE_PACKAGES"
-  exec /usr/bin/arch -arm64 "\$DIR/WordGrab-bin" "\$PROJECT_ROOT/app.py" >> "\$PROJECT_ROOT/data/app.log" 2>&1
-fi
-
 PYTHON="\$PROJECT_ROOT/.venv/bin/python"
+# 优先使用完整虚拟环境，确保 torch / FunASR 等依赖可用。
 if [[ ! -x "\$PYTHON" ]]; then
   PYTHON="\$(command -v python3 || true)"
 fi

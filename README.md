@@ -6,7 +6,8 @@
 
 ## 功能特性
 
-- 桌面 GUI：历史记录、文稿点读联动、音频播放器、说话人改名、搜索，以及导出 TXT。
+- 桌面 GUI：历史记录、批量管理、文稿点读联动、音频播放器、说话人改名、搜索，以及导出 TXT、PDF、Word。
+- 历史索引使用本地 SQLite 管理，文稿正文仍以独立 JSON 文件保存，并保留 JSON 备份便于恢复。
 - 命令行模式：适合快速批量或单个音频转写。
 - 两阶段转写：先快速生成逐步出现的初稿，再完成声纹分离并输出完整文稿。
 - 内置响度归一化预处理，帮助改善较轻声或远场录音的识别效果。
@@ -22,8 +23,8 @@
 ## Quick Start
 
 ```bash
-git clone <repo>
-cd <repo>
+git clone https://github.com/lawmanyukk-boop/WordGrab.git
+cd WordGrab
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python app.py        # GUI
@@ -40,7 +41,17 @@ python3 -m venv .venv
 bash scripts/make_app.sh
 ```
 
-脚本会在项目根目录生成 `WordGrab.app`。双击它可启动桌面 GUI；该 App 会优先使用项目内的 `.venv`，没有时回退到系统的 `python3`。
+脚本默认在项目根目录生成 `WordGrab.app`，也可以传入安装位置：
+
+```bash
+bash scripts/make_app.sh /Applications/WordGrab.app
+```
+
+脚本会把最新版源代码同步到 `~/Library/Application Support/录音转文字`。桌面 App 优先使用该目录中的 `.venv`，没有时回退到系统的 `python3`。开发调试建议直接运行项目目录中的 `.venv/bin/python app.py`。
+
+## 本地数据与隐私
+
+录音、文稿、索引、设置和日志默认保存在本机，不提交到 GitHub。仓库的 `.gitignore` 已排除 `data/`、模型缓存、虚拟环境、运行时副本和构建产物。
 
 ## 精度 Tips
 

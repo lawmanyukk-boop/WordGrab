@@ -4,3 +4,6 @@ torch>=2.4
 torchaudio>=2.4
 pywebview>=6.0
 soundfile>=0.13
+imageio-ffmpeg>=0.6
+python-docx>=1.1
+reportlab>=4.0

@@ -3,6 +3,10 @@ venv/
 __pycache__/
 *.pyc
 data/
+tmp/
+runtime-backup/
+design/
+design-qa.md
 *.log
 .DS_Store
 bin/
@@ -10,3 +14,4 @@ WordGrab.app/
 录音转文字.app/
 dist/
 *.icns.tmp
+storage.json
