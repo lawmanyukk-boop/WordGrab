@@ -4,51 +4,54 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WordGrab</title>
+<script>
+  (() => {
+    const params = new URLSearchParams(location.search);
+    let savedTheme = '';
+    try { savedTheme = localStorage.getItem('wordgrab-theme') || ''; } catch (_) {}
+    document.documentElement.dataset.theme = params.get('theme') || savedTheme || 'aurora-sea';
+    if (params.get('preview') === '1') document.documentElement.classList.add('preview-mode');
+    if (params.get('clean') === '1') document.documentElement.classList.add('clean-preview');
+  })();
+</script>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+<div class="pywebview-drag-region app-drag-region" aria-hidden="true"></div>
 <div id="app">
 
   <!-- 侧边栏 -->
   <aside class="sidebar">
-    <div class="brand">
-      <div class="brand-logo">
-        <svg viewBox="253.5 250 576 576" width="30" height="30" xmlns="http://www.w3.org/2000/svg" aria-label="WordGrab logo">
-          <defs><clipPath id="disc"><circle cx="541.5" cy="538" r="288"></circle></clipPath></defs>
-          <circle cx="541.5" cy="538" r="288" fill="#191919"></circle>
-          <g clip-path="url(#disc)">
-            <path d="M 527 433.62 L 559 433.62 C 572.95 433.62 576.05 439.62 590 439.62 L 815.6 439.62 L 815.6 447.62 L 590 447.62 C 576.05 447.62 572.95 453.62 559 453.62 L 527 453.62 A 26 10 0 0 1 527 433.62 Z" fill="#FF5C4D"></path>
-            <path d="M 480.5 457.5 L 611 457.5 C 622.7 457.5 625.3 463.5 637 463.5 L 822.61 463.5 L 822.61 470.5 L 637 470.5 C 625.3 470.5 622.7 476.5 611 476.5 L 480.5 476.5 A 9.5 9.5 0 0 1 480.5 457.5 Z" fill="#FF9F1C"></path>
-            <path d="M 461.5 481.48 L 636 481.48 C 644.55 481.48 646.45 486.98 655 486.98 L 827.64 486.98 L 827.64 494.98 L 655 494.98 C 646.45 494.98 644.55 500.48 636 500.48 L 461.5 500.48 A 9.5 9.5 0 0 1 461.5 481.48 Z" fill="#FFD23F"></path>
-            <path d="M 451 504.48 L 643 504.48 C 655.15 504.48 657.85 510.48 670 510.48 L 830.54 510.48 L 830.54 518.48 L 670 518.48 C 657.85 518.48 655.15 524.48 643 524.48 L 451 524.48 A 10 10 0 0 1 451 504.48 Z" fill="#FFD23F"></path>
-            <path d="M 445.5 528.51 L 650 528.51 C 658.1 528.51 659.9 534.01 668 534.01 L 831.5 534.01 L 831.5 542.01 L 668 542.01 C 659.9 542.01 658.1 547.51 650 547.51 L 445.5 547.51 A 9.5 9.5 0 0 1 445.5 528.51 Z" fill="#2EC4B6"></path>
-            <path d="M 450.5 552.5 L 647 552.5 C 658.7 552.5 661.3 558.5 673 558.5 L 830.5 558.5 L 830.5 565.5 L 673 565.5 C 661.3 565.5 658.7 571.5 647 571.5 L 450.5 571.5 A 9.5 9.5 0 0 1 450.5 552.5 Z" fill="#3A86FF"></path>
-            <path d="M 461.5 576.48 L 635 576.48 C 644 576.48 646 581.98 655 581.98 L 827.47 581.98 L 827.47 589.98 L 655 589.98 C 646 589.98 644 595.48 635 595.48 L 461.5 595.48 A 9.5 9.5 0 0 1 461.5 576.48 Z" fill="#8338EC"></path>
-            <path d="M 480 600.5 L 615 600.5 C 623.1 600.5 624.9 605.5 633 605.5 L 822.48 605.5 L 822.48 613.5 L 633 613.5 C 624.9 613.5 623.1 618.5 615 618.5 L 480 618.5 A 9 9 0 0 1 480 600.5 Z" fill="#8338EC"></path>
-            <path d="M 530 623.12 L 567 623.12 C 578.25 623.12 580.75 629.62 592 629.62 L 815.34 629.62 L 815.34 636.62 L 592 636.62 C 580.75 636.62 578.25 643.12 567 643.12 L 530 643.12 A 29 10 0 0 1 530 623.12 Z" fill="#FF4D8D"></path>
-          </g>
-        </svg>
-      </div>
-      <span>WordGrab</span>
-    </div>
-
     <button id="importBtn" class="btn-primary">
       <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M11 5a1 1 0 1 1 2 0v6h6a1 1 0 1 1 0 2h-6v6a1 1 0 1 1-2 0v-6H5a1 1 0 1 1 0-2h6V5z"/></svg>
       导入音频
     </button>
 
-    <div class="search-wrap">
+    <label class="search-wrap" for="sideSearch">
+      <span>查找文稿</span>
       <input id="sideSearch" placeholder="搜索记录…" autocomplete="off">
+    </label>
+
+    <div class="history-head">
+      <span>最近文稿</span>
+      <span><button id="historyManage" type="button">批量选择</button><button id="historySort" type="button">最新</button></span>
     </div>
+    <div id="historyBatchBar" class="history-batch hidden"><span id="historySelected">已选 0 条</span><button id="historyExport" type="button">批量导出</button><button id="historyDelete" type="button">批量删除</button></div>
 
     <div id="historyList" class="history"></div>
+
+    <footer class="sidebar-footer">
+      <button id="settingsBtn" class="settings-entry" type="button" aria-label="打开设置" title="设置" aria-expanded="false" aria-controls="settingsCenter">
+        <img src="/static/LOGO.svg" alt="">
+      </button>
+    </footer>
   </aside>
 
   <!-- 主区 -->
   <main class="main">
     <!-- 空态 -->
     <div id="empty" class="empty">
-      <div class="empty-illu">🎧</div>
+      <img class="empty-illu" src="/static/icon_1024.png" alt="">
       <h2>把录音变成文字稿</h2>
       <p>点击左上角「导入音频」，或把文件拖进窗口<br>中文高精度 · 自动区分说话人 · 全程本地</p>
       <button id="importBtn2" class="btn-primary lg">导入音频</button>
@@ -56,35 +59,101 @@
 
     <!-- 内容 -->
     <div id="content" class="content hidden">
-      <header class="doc-head">
-        <div class="doc-title">
-          <h1 id="docTitle" title="双击改名"></h1>
-          <div class="doc-meta"><span id="docMeta"></span></div>
-          <div id="spkBar" class="spk-bar"></div>
+      <header class="topbar">
+        <div class="view-tabs" role="tablist" aria-label="文稿视图">
+          <button class="view-tab active" type="button" role="tab" data-view="transcript">文稿</button>
+          <button class="view-tab" type="button" role="tab" data-view="speakers">说话人</button>
+          <button class="view-tab" type="button" role="tab" data-view="file">文件信息</button>
         </div>
         <div class="doc-actions">
           <div class="mini-search">
             <input id="docSearch" placeholder="全文搜索…" autocomplete="off">
             <span id="searchCount" class="search-count"></span>
           </div>
-          <button id="exportBtn" class="btn-ghost">导出 txt</button>
-          <button id="deleteBtn" class="btn-ghost danger">删除</button>
+          <div id="exportControl" class="export-control">
+            <button id="exportBtn" class="btn-ghost export-btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="exportMenu">导出 TXT</button>
+            <div id="exportMenu" class="export-menu hidden" role="menu" aria-label="导出格式">
+              <button class="export-option" type="button" role="menuitem" data-format="docx"><strong>Word 文档</strong><small>.docx · 可继续编辑</small></button>
+              <button class="export-option" type="button" role="menuitem" data-format="pdf"><strong>PDF 文档</strong><small>.pdf · 适合分享和打印</small></button>
+              <button class="export-option" type="button" role="menuitem" data-format="txt"><strong>纯文本</strong><small>.txt · 通用轻量</small></button>
+            </div>
+          </div>
+          <button id="deleteBtn" class="btn-ghost danger" type="button">删除</button>
         </div>
       </header>
 
-      <div id="liveBanner" class="live-banner hidden"></div>
+      <section class="document">
+        <header class="doc-head">
+          <div class="doc-title">
+            <span id="docEyebrow" class="doc-eyebrow">本地文稿</span>
+            <h1 id="docTitle" title="双击改名"></h1>
+            <div class="doc-meta"><span id="docMeta"></span></div>
+            <div id="spkBar" class="spk-bar"></div>
+          </div>
+          <span id="docStatus" class="status-pill">已完成</span>
+        </header>
 
-      <div id="transcript" class="transcript"></div>
+        <div id="liveBanner" class="live-banner hidden"></div>
+
+        <div id="readingGrid" class="reading-grid" data-view="transcript">
+          <div id="transcript" class="transcript"></div>
+
+          <aside class="inspector" aria-label="说话人与文件信息">
+            <section class="inspector-section speaker-inspector">
+              <div class="inspector-title"><strong>说话人</strong><span>点击可改名</span></div>
+              <div id="speakerList" class="speaker-list"></div>
+            </section>
+            <section class="inspector-section file-inspector">
+              <div class="inspector-title"><strong>音频</strong></div>
+              <dl class="file-facts">
+                <div><dt>格式</dt><dd id="fileFormat">—</dd></div>
+                <div><dt>时长</dt><dd id="fileDuration">00:00</dd></div>
+                <div><dt>语言</dt><dd>中文</dd></div>
+                <div><dt>处理</dt><dd>本地</dd></div>
+              </dl>
+            </section>
+          </aside>
+        </div>
+      </section>
 
       <!-- 播放器 -->
       <div class="player">
-        <button id="playBtn" class="play-btn" aria-label="播放">
-          <svg id="playIcon" viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
-        </button>
-        <span id="curTime" class="time">00:00</span>
-        <input id="seek" class="seek" type="range" min="0" max="1000" value="0">
-        <span id="totTime" class="time">00:00</span>
-        <button id="speedBtn" class="speed">1.0×</button>
+        <input id="seek" class="seek" type="range" min="0" max="1000" value="0" aria-label="播放进度">
+        <div class="player-controls">
+          <button id="playBtn" class="play-btn" aria-label="播放">
+            <svg id="playIcon" viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>
+          </button>
+            <button id="rewindBtn" class="transport-btn" type="button" aria-label="后退15秒" title="后退15秒">
+            <img src="/static/player-rotate-left.svg" alt=""><span>15</span>
+          </button>
+            <button id="forwardBtn" class="transport-btn" type="button" aria-label="前进15秒" title="前进15秒">
+            <img src="/static/player-rotate-right.svg" alt=""><span>15</span>
+          </button>
+          <div id="volumeControl" class="volume-control">
+            <button id="volumeBtn" class="transport-btn volume-btn" type="button" aria-label="调节音量，当前100%" aria-haspopup="true" aria-expanded="false" aria-controls="volumePanel" title="调节音量">
+              <img src="/static/player-volume.svg" alt="">
+            </button>
+            <div id="volumePanel" class="volume-panel hidden">
+              <input id="volumeSlider" class="volume-slider" type="range" min="0" max="1" step="0.01" value="1" aria-label="音量">
+              <span id="volumeValue" class="volume-value">100%</span>
+            </div>
+          </div>
+          <div class="player-time"><span id="curTime">00:00</span><span class="time-divider">/</span><span id="totTime">00:00</span></div>
+          <span class="player-spacer"></span>
+          <div id="speedControl" class="speed-control">
+            <button id="speedBtn" class="speed" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="speedMenu">1.0×</button>
+            <div id="speedMenu" class="speed-menu hidden" role="menu" aria-label="播放速度">
+              <button class="speed-option" type="button" role="menuitemradio" aria-checked="false" data-speed="2">2×</button>
+              <button class="speed-option" type="button" role="menuitemradio" aria-checked="false" data-speed="1.75">1.75×</button>
+              <button class="speed-option" type="button" role="menuitemradio" aria-checked="false" data-speed="1.5">1.5×</button>
+              <button class="speed-option" type="button" role="menuitemradio" aria-checked="false" data-speed="1.25">1.25×</button>
+              <button class="speed-option" type="button" role="menuitemradio" aria-checked="true" data-speed="1">1.0×</button>
+              <button class="speed-option" type="button" role="menuitemradio" aria-checked="false" data-speed="0.75">0.75×</button>
+              <button class="speed-option" type="button" role="menuitemradio" aria-checked="false" data-speed="0.5">0.5×</button>
+              <button class="speed-option" type="button" role="menuitemradio" aria-checked="false" data-speed="0.25">0.25×</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -102,15 +171,182 @@
 
 </div>
 
+<div id="settingsOverlay" class="settings-overlay hidden">
+  <section id="settingsCenter" class="settings-center" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <aside class="settings-navigation">
+      <div class="settings-brand">
+        <img src="/static/LOGO.svg" alt="">
+        <span><strong>WordGrab</strong><small>设置</small></span>
+      </div>
+      <nav aria-label="设置分类">
+        <button class="settings-nav-item active" type="button" data-settings-page="general">通用</button>
+        <button class="settings-nav-item" type="button" data-settings-page="transcription">转写与导出</button>
+        <button class="settings-nav-item" type="button" data-settings-page="appearance">外观</button>
+        <button class="settings-nav-item" type="button" data-settings-page="storage">存储与隐私</button>
+        <button class="settings-nav-item" type="button" data-settings-page="about">关于</button>
+      </nav>
+      <p class="settings-local-note">所有设置与音频均保存在本机</p>
+    </aside>
+
+    <div class="settings-workspace">
+      <header class="settings-toolbar">
+        <span><h2 id="settingsTitle">通用</h2><p id="settingsSubtitle">调整日常使用习惯</p></span>
+        <button id="settingsClose" class="settings-done" type="button">完成</button>
+      </header>
+
+      <div class="settings-scroll">
+        <section class="settings-page active" data-settings-content="general">
+          <div class="setting-group">
+            <label class="setting-row">
+              <span><strong>启动时打开上次文稿</strong><small>继续上一次的阅读位置</small></span>
+              <span class="setting-switch"><input type="checkbox" data-setting="reopen_last"><i></i></span>
+            </label>
+            <label class="setting-row">
+              <span><strong>导入完成后自动打开</strong><small>关闭后在后台完成并保留当前页面</small></span>
+              <span class="setting-switch"><input type="checkbox" data-setting="auto_open_import"><i></i></span>
+            </label>
+          </div>
+          <h3 class="setting-section-title">播放器</h3>
+          <div class="setting-group">
+            <label class="setting-row">
+              <span><strong>默认播放速度</strong><small>每次打开文稿时使用</small></span>
+              <select data-setting="default_speed">
+                <option value="0.75">0.75×</option><option value="1">1.0×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option>
+              </select>
+            </label>
+            <label class="setting-row">
+              <span><strong>前进与后退间隔</strong><small>应用到播放器的两个跳转按钮</small></span>
+              <select data-setting="skip_seconds">
+                <option value="5">5 秒</option><option value="10">10 秒</option><option value="15">15 秒</option><option value="30">30 秒</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="settings-page" data-settings-content="transcription">
+          <h3 class="setting-section-title first">转写</h3>
+          <div class="setting-group">
+            <label class="setting-row">
+              <span><strong>自动区分说话人</strong><small>关闭后所有内容按单一说话人整理</small></span>
+              <span class="setting-switch"><input type="checkbox" data-setting="auto_diarization"><i></i></span>
+            </label>
+            <label class="setting-row">
+              <span><strong>转写速度</strong><small>快速模式减少等待；高精度模式会执行更完整的处理</small></span>
+              <select data-setting="transcription_mode"><option value="speed">速度优先</option><option value="accuracy">精度优先</option></select>
+            </label>
+          </div>
+          <h3 class="setting-section-title">导出</h3>
+          <div class="setting-group">
+            <label class="setting-row">
+              <span><strong>默认格式</strong><small>仍可在文稿页临时选择其他格式</small></span>
+              <select data-setting="export_format"><option value="docx">Word（.docx）</option><option value="pdf">PDF（.pdf）</option><option value="txt">纯文本（.txt）</option></select>
+            </label>
+            <div class="setting-row">
+              <span><strong>默认保存位置</strong><small id="exportDirectoryLabel" class="setting-path">文稿</small></span>
+              <button id="chooseExportDirectory" class="setting-action" type="button">更改</button>
+            </div>
+            <label class="setting-row">
+              <span><strong>文件命名</strong><small>控制自动生成的导出文件名</small></span>
+              <select data-setting="filename_rule"><option value="source_date">原文件名＋转写日期</option><option value="source">仅原文件名</option></select>
+            </label>
+          </div>
+        </section>
+
+        <section class="settings-page" data-settings-content="appearance">
+          <div class="setting-group">
+            <button id="themeDrillBtn" class="setting-row setting-drill" type="button">
+              <span><strong>主题</strong><small id="currentThemeLabel">极光海 · 11种配色</small></span><b aria-hidden="true">›</b>
+            </button>
+            <label class="setting-row">
+              <span><strong>文稿字号</strong><small>只改变文稿正文大小</small></span>
+              <select data-setting="font_size"><option value="small">小</option><option value="standard">标准</option><option value="large">大</option></select>
+            </label>
+            <label class="setting-row">
+              <span><strong>列表密度</strong><small>调整左侧历史记录的间距</small></span>
+              <select data-setting="list_density"><option value="compact">紧凑</option><option value="standard">标准</option></select>
+            </label>
+            <div class="setting-row appearance-row">
+              <span><strong>界面外观</strong><small>选择浅色、深色，或跟随系统</small></span>
+              <div class="appearance-options" role="radiogroup" aria-label="界面外观">
+                <button class="appearance-card" type="button" role="radio" aria-checked="false" data-appearance-option="system">
+                  <span class="appearance-preview preview-system" aria-hidden="true"><i></i><b></b><em></em></span>
+                  <strong>系统</strong>
+                </button>
+                <button class="appearance-card" type="button" role="radio" aria-checked="true" data-appearance-option="light">
+                  <span class="appearance-preview preview-light" aria-hidden="true"><i></i><b></b><em></em></span>
+                  <strong>浅色</strong>
+                </button>
+                <button class="appearance-card" type="button" role="radio" aria-checked="false" data-appearance-option="dark">
+                  <span class="appearance-preview preview-dark" aria-hidden="true"><i></i><b></b><em></em></span>
+                  <strong>深色</strong>
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-page settings-theme-page" data-settings-content="themes">
+          <button id="themeBackBtn" class="settings-back" type="button">‹ 返回外观</button>
+          <div class="theme-page-heading"><strong>主题</strong><small>同时应用到侧边栏和界面强调色，选择后自动保存</small></div>
+          <div id="themeGrid" class="settings-theme-grid"></div>
+        </section>
+
+        <section class="settings-page" data-settings-content="storage">
+          <div class="privacy-card"><strong>所有音频均在本地处理</strong><p>WordGrab 不会上传录音、文稿或设置。</p></div>
+          <h3 class="setting-section-title">文稿与录音</h3>
+          <div class="setting-group">
+            <div class="setting-row">
+              <span><strong>保存位置</strong><small id="dataPathLabel" class="setting-path">读取中…</small></span>
+              <span class="setting-actions">
+                <button id="changeDataFolder" class="setting-action primary-soft" type="button">更改位置</button>
+                <button id="openDataFolder" class="setting-action" type="button">打开</button>
+              </span>
+            </div>
+            <div class="setting-row"><span><strong>当前占用空间</strong><small>包含录音、文稿和应用设置</small></span><b id="dataSizeLabel" class="setting-value">—</b></div>
+            <label class="setting-row"><span><strong>删除文稿时同时删除录音</strong><small>关闭后录音会移动到“保留的录音”文件夹</small></span><span class="setting-switch"><input type="checkbox" data-setting="delete_audio_with_transcript"><i></i></span></label>
+            <div class="setting-row danger-row"><span><strong>清理全部转写记录</strong><small>执行前会再次确认</small></span><button id="clearHistoryBtn" class="setting-action danger" type="button">清理</button></div>
+          </div>
+          <h3 class="setting-section-title">语音模型</h3>
+          <div class="setting-group">
+            <div class="setting-row"><span><strong>模型缓存</strong><small id="modelPathLabel" class="setting-path">读取中…</small></span><b id="modelSizeLabel" class="setting-value">—</b></div>
+            <div class="setting-row danger-row"><span><strong>清理模型缓存</strong><small>下次转写时需要重新下载</small></span><button id="clearModelBtn" class="setting-action danger" type="button">清理</button></div>
+          </div>
+        </section>
+
+        <section class="settings-page" data-settings-content="about">
+          <div class="about-hero"><img src="/static/LOGO.svg" alt=""><span><strong>WordGrab</strong><small id="versionLabel">版本 —</small></span></div>
+          <div class="setting-group">
+            <div class="setting-row"><span><strong>软件更新</strong><small>GitHub发布后可启用在线检查</small></span><button class="setting-action" type="button" disabled>当前为本地版</button></div>
+            <div class="setting-row"><span><strong>GitHub开源项目</strong><small>仓库发布后会显示项目地址</small></span><button class="setting-action" type="button" disabled>尚未发布</button></div>
+            <div class="setting-row"><span><strong>使用说明</strong><small>打开本地README文档</small></span><button class="setting-action" id="openReadmeBtn" type="button">查看</button></div>
+            <div class="setting-row"><span><strong>软件许可证</strong><small>WordGrab代码采用MIT License</small></span><button class="setting-action" id="openLicenseBtn" type="button">查看</button></div>
+          </div>
+          <h3 class="setting-section-title">运行状态</h3>
+          <div class="setting-group">
+            <div class="setting-row"><span><strong>FFmpeg</strong><small id="ffmpegPathLabel" class="setting-path">检测中…</small></span><b id="ffmpegStatus" class="status-value">—</b></div>
+            <div class="setting-row"><span><strong>语音模型</strong><small>FunASR、说话人分离及标点模型</small></span><b id="modelStatus" class="status-value">—</b></div>
+            <div class="setting-row"><span><strong>模型许可证</strong><small>各模型遵循其原始开源许可证</small></span><button id="openModelsFolder" class="setting-action" type="button">查看文件</button></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </section>
+
+  <div id="settingsConfirm" class="settings-confirm hidden" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <h3 id="confirmTitle">确认操作</h3><p id="confirmMessage"></p>
+    <div><button id="confirmCancel" type="button">取消</button><button id="confirmAccept" class="danger" type="button">确认</button></div>
+  </div>
+</div>
+
 <div id="dropHint" class="drop-hint hidden">
   <div class="drop-hint-card">
-    <div class="drop-hint-icon">🎧</div>
+    <img class="drop-hint-icon" src="/static/icon_1024.png" alt="">
     <div class="drop-hint-text">松开鼠标，开始转写</div>
   </div>
 </div>
 
 <audio id="audio"></audio>
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast"><span id="toastText"></span><button id="toastAction" type="button" class="hidden">撤销</button></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

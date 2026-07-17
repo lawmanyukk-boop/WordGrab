@@ -38,6 +38,13 @@ def _resolve_ffmpeg():
         _FFMPEG = bundled_ffmpeg
         return _FFMPEG
 
+    try:
+        import imageio_ffmpeg
+        _FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+        return _FFMPEG
+    except Exception:
+        pass
+
     raise RuntimeError(
         "未找到 ffmpeg。请先安装：brew install ffmpeg；"
         "或通过环境变量 FFMPEG_PATH 指定 ffmpeg 路径。"
@@ -150,7 +157,7 @@ def transcribe_draft(wav, progress=None, on_chunk=None):
     return segs
 
 
-def transcribe_full(wav, progress=None):
+def transcribe_full(wav, progress=None, mode="accuracy"):
     """完整管线（VAD+ASR+标点+cam++ 声纹分离），返回 segments 列表。"""
     def p(stage, pct=None, info=None):
         if progress:
@@ -158,7 +165,9 @@ def transcribe_full(wav, progress=None):
 
     model = get_model(progress)
     p("说话人分离中…", None)  # 不确定进度
-    res = model.generate(input=wav, batch_size_s=300, hotword="")
+    # 速度优先使用更大的批处理窗口，减少调度次数；精度优先沿用稳妥的默认窗口。
+    batch_size_s = 600 if mode == "speed" else 300
+    res = model.generate(input=wav, batch_size_s=batch_size_s, hotword="")
 
     r = res[0]
     segs = []
