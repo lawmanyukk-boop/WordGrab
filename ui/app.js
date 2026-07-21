@@ -11,12 +11,13 @@ let cur = null;           // 当前记录 {id,title,duration,speakers,segments}
 let startTimer = 0;
 let appSettings = {};
 let skipSeconds = 15;
+let aiTemplates=[];
 
 const DEFAULT_APP_SETTINGS={
   theme:'aurora-sea',reopen_last:true,auto_open_import:true,default_speed:1,skip_seconds:15,
   auto_diarization:true,transcription_mode:'accuracy',export_format:'txt',export_directory:'',
   filename_rule:'source_date',font_size:'standard',list_density:'standard',appearance:'light',follow_system:false,
-  delete_audio_with_transcript:true,last_item_id:''
+  delete_audio_with_transcript:true,last_item_id:'',ai_base_url:'',ai_model:'',ai_summary_template:'general',ai_privacy_host:''
 };
 
 const THEMES=[
@@ -80,7 +81,7 @@ function setSettingsOpen(open){
     refreshSystemInfo();
     requestAnimationFrame(()=>$('.settings-nav-item.active').focus());
   }else{
-    $('#settingsConfirm').classList.add('hidden');
+    $('#confirmOverlay').classList.add('hidden');
   }
 }
 
@@ -93,6 +94,7 @@ const systemAppearance=window.matchMedia('(prefers-color-scheme: dark)');
 const SETTINGS_META={
   general:['通用','调整日常使用习惯'],
   transcription:['转写与导出','设置处理方式与文件输出'],
+  ai:['AI 服务','连接通用 AI 接口并管理总结方式'],
   appearance:['外观','调整界面阅读体验'],
   themes:['主题','选择一款喜欢的界面配色'],
   storage:['存储与隐私','管理本地数据和模型'],
@@ -190,16 +192,87 @@ async function refreshSystemInfo(){
 
 function confirmSettingsAction(title,message,confirmLabel='确认'){
   return new Promise(resolve=>{
-    const dialog=$('#settingsConfirm');
+    const overlay=$('#confirmOverlay');
     $('#confirmTitle').textContent=title;
     $('#confirmMessage').textContent=message;
     $('#confirmAccept').textContent=confirmLabel;
-    dialog.classList.remove('hidden');
-    const finish=value=>{dialog.classList.add('hidden');resolve(value);};
+    overlay.classList.remove('hidden');
+    const finish=value=>{overlay.classList.add('hidden');resolve(value);};
     $('#confirmCancel').onclick=()=>finish(false);
     $('#confirmAccept').onclick=()=>finish(true);
     requestAnimationFrame(()=>$('#confirmCancel').focus());
   });
+}
+
+async function loadAiSettings(){
+  if(!API||!API.get_ai_settings)return;
+  try{
+    const values=await API.get_ai_settings();
+    $('#aiBaseUrl').value=values.base_url||'';
+    $('#aiModel').value=values.model||'';
+    await loadAiTemplates();
+    setTemplateSelectValue(values.summary_template||'general');
+    $('#aiApiKey').value='';
+    $('#aiKeyHint').textContent=values.key_configured?`已保存 Key · 尾号 ${values.key_last4}`:'仅保存在本机，不会上传或写入项目';
+    $('#aiConnectionStatus').textContent=values.key_configured&&values.base_url&&values.model?'配置已保存':'尚未完成配置';
+  }catch(_){$('#aiConnectionStatus').textContent='暂时无法读取 AI 设置';}
+}
+
+function renderTemplateSelects(selected){
+  const options=aiTemplates.map(item=>`<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
+  $('#aiDefaultTemplate').innerHTML=options;
+  $('#summaryTemplate').innerHTML=options;
+  const customCount=aiTemplates.filter(item=>!item.builtin).length,countLabel=$('#aiTemplateCount');
+  if(countLabel)countLabel.textContent=customCount?`已创建 ${customCount} 个自定义模板`:'尚未创建自定义模板';
+  setTemplateSelectValue(selected||appSettings.ai_summary_template||'general');
+}
+function setTemplateSelectValue(value){
+  const valid=aiTemplates.some(item=>item.id===value)?value:'general';
+  $('#aiDefaultTemplate').value=valid;$('#summaryTemplate').value=valid;
+}
+async function loadAiTemplates(){
+  try{aiTemplates=API&&API.list_ai_templates?await API.list_ai_templates():[{id:'general',name:'通用摘要',builtin:true}];}
+  catch(_){aiTemplates=[{id:'general',name:'通用摘要',builtin:true}];}
+  renderTemplateSelects(appSettings.ai_summary_template||'general');
+  return aiTemplates;
+}
+
+function aiFormValues(){return {base_url:$('#aiBaseUrl').value.trim(),api_key:$('#aiApiKey').value.trim(),model:$('#aiModel').value.trim(),summary_template:$('#aiDefaultTemplate').value};}
+
+function renderModelChips(models){
+  const box=$('#aiModelChips');if(!box)return;
+  box.innerHTML='';
+  if(!models||!models.length){box.classList.add('hidden');return;}
+  models.forEach(model=>{
+    const chip=document.createElement('button');
+    chip.type='button';chip.className='ai-model-chip';chip.textContent=model;
+    chip.setAttribute('role','option');
+    chip.onclick=()=>{$('#aiModel').value=model;highlightSelectedModelChip();};
+    box.appendChild(chip);
+  });
+  box.classList.remove('hidden');
+  highlightSelectedModelChip();
+}
+
+function highlightSelectedModelChip(){
+  const current=$('#aiModel').value.trim();
+  document.querySelectorAll('#aiModelChips .ai-model-chip').forEach(chip=>{
+    const on=chip.textContent===current;
+    chip.classList.toggle('is-selected',on);
+    chip.setAttribute('aria-selected',on?'true':'false');
+  });
+}
+
+async function saveAiConfiguration(){
+  const button=$('#saveAiSettings');button.disabled=true;button.textContent='正在保存…';
+  try{
+    const result=await API.save_ai_settings(aiFormValues());
+    if(!result||!result.ok){toast(result&&result.message||'AI 设置保存失败');return false;}
+    appSettings.ai_base_url=result.base_url;appSettings.ai_model=result.model;appSettings.ai_summary_template=result.summary_template;
+    $('#summaryTemplate').value=result.summary_template;
+    await loadAiSettings();toast('AI 设置已保存');return true;
+  }catch(_){toast('AI 设置保存失败');return false;}
+  finally{button.disabled=false;button.textContent='保存设置';}
 }
 
 async function initSettingsCenter(){
@@ -228,6 +301,7 @@ async function initSettingsCenter(){
   if(requested) appSettings.theme=requested;
   applyPersistentSettings();
   syncSettingControls();
+  await loadAiSettings();
 
   $('#settingsBtn').onclick=(event)=>{
     event.stopPropagation();
@@ -301,6 +375,31 @@ async function initSettingsCenter(){
     if(!result||!result.ok){toast(result&&result.message||'清理失败');return;}
     await refreshSystemInfo();toast(`已释放 ${formatBytes(result.freed)}`);
   };
+  $('#saveAiSettings').onclick=saveAiConfiguration;
+  $('#loadAiModels').onclick=async()=>{
+    const button=$('#loadAiModels');button.disabled=true;button.textContent='读取中…';
+    try{
+      const values=aiFormValues();
+      const result=await API.list_ai_models(values.base_url,values.api_key);
+      if(!result||!result.ok){toast(result&&result.message||'无法获取模型');return;}
+      const list=$('#aiModelList');list.innerHTML='';
+      (result.models||[]).forEach(model=>{const option=document.createElement('option');option.value=model;list.appendChild(option);});
+      $('#aiConnectionStatus').textContent=`已读取 ${result.models.length} 个模型`;
+      if(!$('#aiModel').value&&result.models.length)$('#aiModel').value=result.models[0];
+      renderModelChips(result.models||[]);
+    }catch(_){toast('无法获取模型');}
+    finally{button.disabled=false;button.textContent='获取模型';}
+  };
+  $('#aiModel').addEventListener('input',highlightSelectedModelChip);
+  $('#testAiConnection').onclick=async()=>{
+    const button=$('#testAiConnection');button.disabled=true;button.textContent='测试中…';$('#aiConnectionStatus').textContent='正在连接 AI 服务…';
+    try{
+      const result=await API.test_ai_connection(aiFormValues());
+      if(result&&result.ok){$('#aiConnectionStatus').textContent=`连接成功 · ${result.model} · ${result.elapsed}秒`;toast('AI 服务连接成功');}
+      else{$('#aiConnectionStatus').textContent=result&&result.message||'连接失败';toast(result&&result.message||'连接失败');}
+    }catch(_){$('#aiConnectionStatus').textContent='连接失败';toast('无法连接 AI 服务');}
+    finally{button.disabled=false;button.textContent='测试连接';}
+  };
   document.addEventListener('keydown',event=>{
     if(event.key==='Escape'&&!$('#settingsOverlay').classList.contains('hidden'))setSettingsOpen(false);
   });
@@ -316,6 +415,7 @@ async function loadHistory(){
 function renderHistory(items){
   const q = $('#sideSearch').value.trim();
   const list = $('#historyList');
+  const previousScrollTop=list.scrollTop;
   list.innerHTML='';
   items.filter(x=>(!q||x.title.includes(q))).forEach((x,index)=>{
     const el=document.createElement('button');
@@ -326,12 +426,97 @@ function renderHistory(items){
       <span class="hist-copy"><span class="t">${escapeHtml(x.title)}</span>
       <span class="m"><span title="${escapeHtml(x.error||'')}">${x.status==='error'?'失败':x.status==='running'?'处理中':x.created||''}</span><span>${fmt(x.duration)}</span><span>${x.n_speakers}人</span></span></span>`;
     el.onclick=event=>{if(event.target.closest('.hist-check'))return;if(window.historyManageMode)return;openItem(x.id);};
+    el.oncontextmenu=async event=>{
+      event.preventDefault();event.stopPropagation();
+      if(window.historyManageMode)return;
+      const point={x:event.clientX,y:event.clientY};
+      if(!cur||cur.id!==x.id)await openItem(x.id);
+      openHistoryContextMenu(x.id,point.x,point.y);
+    };
+    el.onkeydown=event=>{
+      if((event.shiftKey&&event.key==='F10')||event.key==='ContextMenu'){
+        event.preventDefault();const rect=el.getBoundingClientRect();
+        openHistoryContextMenu(x.id,rect.left+Math.min(rect.width-18,70),rect.top+18);
+      }
+    };
     el.querySelector('.hist-check')?.addEventListener('change',updateHistorySelection);
     list.appendChild(el);
   });
+  list.scrollTop=previousScrollTop;
+  requestAnimationFrame(()=>keepHistoryCutoutVisible(list));
   updateHistorySelection();
 }
+function keepHistoryCutoutVisible(list=$('#historyList')){
+  const active=list.querySelector('.hist-item.active');
+  if(!active)return;
+  const listRect=list.getBoundingClientRect();
+  const activeRect=active.getBoundingClientRect();
+  const cutoutSpace=34;
+  let delta=0;
+  if(activeRect.top<listRect.top+cutoutSpace)delta=activeRect.top-(listRect.top+cutoutSpace);
+  else if(activeRect.bottom>listRect.bottom-cutoutSpace)delta=activeRect.bottom-(listRect.bottom-cutoutSpace);
+  if(Math.abs(delta)>1)list.scrollBy({top:delta,behavior:'smooth'});
+}
 function escapeHtml(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+let historyContextId='';
+function closeHistoryContextMenu(){
+  const menu=$('#historyContextMenu');if(!menu)return;
+  menu.classList.add('hidden');historyContextId='';
+  menu.querySelectorAll('.context-submenu-host').forEach(host=>host.classList.remove('open-left'));
+}
+function openHistoryContextMenu(id,x,y){
+  const menu=$('#historyContextMenu');if(!menu)return;
+  historyContextId=id;menu.classList.remove('hidden');
+  menu.style.left='0px';menu.style.top='0px';
+  const width=menu.offsetWidth,height=menu.offsetHeight,pad=8;
+  const left=Math.max(pad,Math.min(x,window.innerWidth-width-pad));
+  const top=Math.max(pad,Math.min(y,window.innerHeight-height-pad));
+  menu.style.left=`${left}px`;menu.style.top=`${top}px`;
+  const openLeft=left+width+190>window.innerWidth-pad;
+  menu.querySelectorAll('.context-submenu-host').forEach(host=>host.classList.toggle('open-left',openLeft));
+  requestAnimationFrame(()=>menu.querySelector('button')?.focus({preventScroll:true}));
+}
+async function deleteContextDocument(id){
+  const item=(window.historyItems||[]).find(value=>value.id===id),title=item&&item.title||'这份文稿';
+  const extra=appSettings.delete_audio_with_transcript?'文稿和原始录音都会删除。':'文稿会删除，原始录音会保留。';
+  if(!await confirmSettingsAction('删除这份文稿',`“${title}”会先移入最近删除，可在接下来的几秒内撤销。${extra}`,'删除'))return;
+  const result=await API.delete_item(id);
+  if(!result||result.ok===false){toast(result&&result.message||'删除失败');return;}
+  if(cur&&cur.id===id){cur=null;audio.pause();audio.removeAttribute('src');$('#content').classList.add('hidden');$('#empty').classList.remove('hidden');}
+  await loadHistory();toast('文稿已移入最近删除',async()=>{const restored=await API.restore_deleted_item(result.id);if(restored&&restored.ok){await loadHistory();toast('文稿已恢复');}else toast(restored&&restored.message||'恢复失败');});
+}
+$('#historyContextMenu').addEventListener('click',async event=>{
+  const button=event.target.closest('[data-context-action]');if(!button)return;
+  event.stopPropagation();const id=historyContextId,action=button.dataset.contextAction;
+  closeHistoryContextMenu();if(!id)return;
+  try{
+    if(action==='rename'){
+      const item=(window.historyItems||[]).find(value=>value.id===id),name=prompt('重命名文稿：',item&&item.title||'');
+      if(name==null||!name.trim())return;const title=name.trim();await API.rename_item(id,title);
+      if(cur&&cur.id===id){cur.title=title;$('#docTitle').textContent=title;}await loadHistory();toast('文稿已重命名');
+    }else if(action==='export-document'||action==='export-summary'){
+      if(action==='export-summary'&&API.get_ai_summary&&!await API.get_ai_summary(id)){toast('当前录音还没有 AI 总结');return;}
+      const path=action==='export-summary'&&API.export_ai_summary
+        ?await API.export_ai_summary(id,appSettings.export_format)
+        :await API.export_document(id,appSettings.export_format);
+      if(path)toast('已导出：'+path.split('/').pop());
+    }else if(action==='reveal-document'||action==='reveal-summary'){
+      const summary=action==='reveal-summary',resource=summary?'summary':'document';
+      let result=await API.reveal_item_resource(id,resource);
+      if(result&&result.needs_export){
+        if(summary&&API.get_ai_summary&&!await API.get_ai_summary(id)){toast('当前录音还没有 AI 总结');return;}
+        const path=summary&&API.export_ai_summary
+          ?await API.export_ai_summary(id,appSettings.export_format)
+          :await API.export_document(id,appSettings.export_format);
+        if(!path)return;
+        result=await API.reveal_item_resource(id,resource);
+      }
+      if(result&&result.ok)toast('已在 Finder 中显示：'+(result.filename||result.path.split('/').pop()));
+      else toast(result&&result.message||'无法在 Finder 中显示');
+    }else if(action==='delete')await deleteContextDocument(id);
+  }catch(error){toast('操作失败：'+(error&&error.message||error));}
+});
 
 /* ---------- 打开一条 ---------- */
 async function openItem(id, keepScroll){
@@ -382,30 +567,46 @@ function renderSpkBar(){
   idxs.forEach(i=>{
     const chip=document.createElement('span');
     chip.className='spk-chip'; chip.style.background=spkColor(i); chip.dataset.spk=i;
-    chip.title='点击改名（该说话人全部记录都会改）';
+    chip.title='双击改名（该说话人全部记录都会改）';
     chip.textContent=spkName(i).slice(-2);
-    chip.onclick=()=>renameSpeakerByPrompt(i);
+    chip.ondblclick=()=>{
+      const name=list&&list.querySelector(`.speaker-row-name[data-spk="${i}"]`);
+      if(name)beginInlineSpeakerRename(i,name);
+    };
     bar.appendChild(chip);
 
     if(list){
-      const row=document.createElement('button');
-      row.type='button'; row.className='speaker-row';
+      const row=document.createElement('div');
+      row.className='speaker-row';row.tabIndex=0;row.setAttribute('role','group');
       row.innerHTML=`<span class="speaker-row-avatar" style="background:${spkColor(i)}">${escapeHtml(spkName(i).slice(-1))}</span>
-        <span><strong>${escapeHtml(spkName(i))}</strong><small>说话人 ${i+1} · 点击改名</small></span>`;
-      row.onclick=()=>renameSpeakerByPrompt(i);
+        <span class="speaker-row-copy"><strong class="speaker-row-name" data-spk="${i}" title="双击改名">${escapeHtml(spkName(i))}</strong><small>说话人 ${i+1} · 双击改名</small></span>`;
+      const name=row.querySelector('.speaker-row-name');
+      name.ondblclick=event=>{event.stopPropagation();beginInlineSpeakerRename(i,name);};
+      row.onkeydown=event=>{if((event.key==='Enter'||event.key==='F2')&&!name.isContentEditable){event.preventDefault();beginInlineSpeakerRename(i,name);}};
       list.appendChild(row);
     }
   });
 }
 
-async function renameSpeakerByPrompt(i){
-  if(cur&&cur.live) return;
-  const name=prompt('把"'+spkName(i)+'"改名为：',spkName(i));
-  if(name==null) return;
-  const trimmed=name.trim(); if(!trimmed) return;
-  cur.speakers[String(i)]=trimmed;
-  await API.rename_speaker(cur.id,i,trimmed);
-  renderTranscript(); renderSpkBar();
+function beginInlineSpeakerRename(i,element){
+  if(!cur||cur.live||!element)return;
+  const original=spkName(i);let cancelled=false,finished=false;
+  element.contentEditable='true';element.classList.add('editing');element.focus();
+  document.execCommand('selectAll',false,null);
+  const finish=async save=>{
+    if(finished)return;finished=true;element.contentEditable='false';element.classList.remove('editing');
+    const name=element.textContent.trim();
+    if(!save||!name){element.textContent=original;return;}
+    if(name===original)return;
+    cur.speakers[String(i)]=name;
+    try{await API.rename_speaker(cur.id,i,name);renderTranscript();renderSpkBar();}
+    catch(_){cur.speakers[String(i)]=original;renderTranscript();renderSpkBar();toast('说话人改名失败');}
+  };
+  element.onkeydown=event=>{
+    if(event.key==='Enter'){event.preventDefault();element.blur();}
+    if(event.key==='Escape'){event.preventDefault();cancelled=true;element.textContent=original;element.blur();}
+  };
+  element.onblur=()=>finish(!cancelled);
 }
 
 function renderTranscript(){
@@ -555,17 +756,20 @@ speedMenu.onkeydown=event=>{
   speedOptions[next].focus();
 };
 document.addEventListener('click',event=>{
+  if(!event.target.closest('#historyContextMenu'))closeHistoryContextMenu();
   if(!speedMenu.classList.contains('hidden')&&!event.target.closest('#speedControl')) setSpeedMenuOpen(false);
   if(!volumePanel.classList.contains('hidden')&&!event.target.closest('#volumeControl')) setVolumePanelOpen(false);
   if(!$('#exportMenu').classList.contains('hidden')&&!event.target.closest('#exportControl')) setExportMenuOpen(false);
 });
 document.addEventListener('keydown',event=>{
   if(event.key==='Escape'){
+    if(!$('#historyContextMenu').classList.contains('hidden')){closeHistoryContextMenu();return;}
+    if(!$('#confirmOverlay').classList.contains('hidden')){$('#confirmCancel').click();return;}
     if(!speedMenu.classList.contains('hidden')){setSpeedMenuOpen(false);speedBtn.focus();}
     if(!volumePanel.classList.contains('hidden')){setVolumePanelOpen(false);volumeBtn.focus();}
     if(!$('#exportMenu').classList.contains('hidden')){setExportMenuOpen(false);$('#exportBtn').focus();}
   }
-  const modal=$('#settingsConfirm').classList.contains('hidden')?($('#settingsOverlay').classList.contains('hidden')?null:$('#settingsCenter')):$('#settingsConfirm');
+  const modal=!$('#confirmOverlay').classList.contains('hidden')?$('#settingsConfirm'):($('#settingsOverlay').classList.contains('hidden')?null:$('#settingsCenter'));
   if(event.key==='Tab'&&modal){const focusable=[...modal.querySelectorAll('button,input,select,[tabindex]:not([tabindex="-1"])')].filter(el=>!el.disabled&&el.offsetParent!==null);if(focusable.length){const first=focusable[0],last=focusable[focusable.length-1];if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}}}
 });
 selectSpeed(curSpeed);
@@ -622,8 +826,9 @@ function updateHistorySelection(){const selected=[...document.querySelectorAll('
 $('#historyExport').onclick=async()=>{const ids=window.historySelected||[];if(!ids.length)return toast('请先选择文稿');const format=(prompt('选择导出格式：txt / pdf / docx','txt')||'').trim().toLowerCase();if(!['txt','pdf','docx'].includes(format))return toast('不支持的导出格式');const result=await API.bulk_export_items(ids,format);if(result&&result.ok)toast(`已批量导出 ${result.count} 份文稿`);else toast(result&&result.message||'批量导出失败');};
 $('#historyDelete').onclick=async()=>{const ids=window.historySelected||[];if(!ids.length)return toast('请先选择文稿');if(!await confirmSettingsAction('删除所选文稿',`将 ${ids.length} 条记录移入最近删除。批量删除暂不支持一次性撤销。`,'删除'))return;const result=await API.bulk_delete_items(ids);if(result&&result.ok){window.historySelected=[];await loadHistory();toast(`已删除 ${result.count} 条记录`);}};
 
-/* ---------- 文稿 / 说话人 / 文件信息 ---------- */
+/* ---------- 文稿 / AI 总结 ---------- */
 function setView(view){
+  if(!['transcript','summary'].includes(view))view='transcript';
   $('#readingGrid').dataset.view=view;
   document.querySelectorAll('.view-tab').forEach(tab=>{
     const active=tab.dataset.view===view;
@@ -631,8 +836,218 @@ function setView(view){
     tab.setAttribute('aria-selected',active?'true':'false');
   });
   $('.mini-search').classList.toggle('hidden',view!=='transcript');
+  const exportNames={docx:'Word',pdf:'PDF',txt:'TXT'};
+  $('#exportBtn').textContent=view==='summary'?'导出 AI 分析':`导出 ${exportNames[appSettings.export_format]||'TXT'}`;
+  if(view==='summary')loadCurrentSummary();
 }
 document.querySelectorAll('.view-tab').forEach(tab=>tab.onclick=()=>setView(tab.dataset.view));
+
+let currentSummary=null,aiTaskTimer=0,activeAiTask='';
+const SUMMARY_LABELS={overview:'概览',one_line_summary:'一句话总结',summary:'智能摘要',chapters:'章节脉络',key_points:'关键信息 / 要点',important_information:'重要信息',next_steps:'后续事项',action_items:'待办与行动项',keywords:'关键词',highlights:'亮点 / 金句',suggestions:'后续建议',purpose:'会议目的',topics:'讨论主题',conclusions:'关键结论',decisions:'已确认决策',actions:'待办事项',risks:'风险与待确认事项'};
+const CONTENT_TYPE_LABELS={meeting:'会议',interview:'访谈',lecture:'讲座',call:'通话',memo:'备忘',other:'其他'};
+
+function closeTemplateDialog(){
+  $('#templateOverlay').classList.add('hidden');
+  setTemplateSelectValue(appSettings.ai_summary_template||'general');
+}
+function fillTemplateForm(template){
+  const item=template||{};$('#templateId').value=item.id||'';$('#templateName').value=item.name||'';
+  $('#templateObjective').value=item.objective||'';$('#templateInstructions').value=item.instructions||'';
+  $('#templateDetail').value=item.detail||'standard';
+  const focus=new Set(item.focus||['内容概述','关键结论','重要信息','决策与共识','行动项']);
+  document.querySelectorAll('.template-focus-grid input').forEach(input=>input.checked=focus.has(input.value));
+}
+function openTemplateEditor(template=null){
+  $('#templateDialogTitle').textContent=template?'编辑分析模板':'新建分析模板';
+  $('#templateManager').classList.add('hidden');$('#templateForm').classList.remove('hidden');fillTemplateForm(template);
+  $('#templateOverlay').classList.remove('hidden');requestAnimationFrame(()=>$('#templateName').focus());
+}
+function openTemplateManager(){
+  $('#templateDialogTitle').textContent='管理分析模板';$('#templateForm').classList.add('hidden');
+  const manager=$('#templateManager');manager.classList.remove('hidden');
+  const custom=aiTemplates.filter(item=>!item.builtin);
+  manager.innerHTML=`<div class="template-manager-list"><div class="template-manager-item"><span><strong>通用摘要</strong><small>系统默认模板</small></span></div>${custom.map(item=>`<div class="template-manager-item" data-template-id="${escapeHtml(item.id)}"><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.detail==='detailed'?'详细':item.detail==='concise'?'精简':'标准')}</small></span><div class="template-manager-actions"><button type="button" data-action="copy">复制</button><button type="button" data-action="edit">编辑</button><button type="button" data-action="delete">删除</button></div></div>`).join('')}</div><button class="ai-primary template-manager-new" type="button">＋ 新建模板</button>`;
+  manager.querySelector('.template-manager-new').onclick=()=>openTemplateEditor();
+  manager.querySelectorAll('[data-action="edit"]').forEach(button=>button.onclick=()=>openTemplateEditor(aiTemplates.find(item=>item.id===button.closest('[data-template-id]').dataset.templateId)));
+  manager.querySelectorAll('[data-action="copy"]').forEach(button=>button.onclick=()=>{const item=aiTemplates.find(value=>value.id===button.closest('[data-template-id]').dataset.templateId);openTemplateEditor({...item,id:'',name:(item.name+' 副本').slice(0,30)});});
+  manager.querySelectorAll('[data-action="delete"]').forEach(button=>button.onclick=async()=>{
+    const id=button.closest('[data-template-id]').dataset.templateId,item=aiTemplates.find(value=>value.id===id);
+    if(!await confirmSettingsAction('删除分析模板',`确定删除“${item&&item.name||''}”吗？已生成的历史分析不会受影响。`,'删除'))return;
+    const result=await API.delete_ai_template(id);if(!result||!result.ok){toast(result&&result.message||'删除失败');return;}
+    aiTemplates=result.templates;renderTemplateSelects('general');openTemplateManager();toast('模板已删除');
+  });
+  $('#templateOverlay').classList.remove('hidden');
+}
+$('#closeTemplateDialog').onclick=closeTemplateDialog;$('#cancelTemplate').onclick=closeTemplateDialog;
+$('#manageAiTemplates').onclick=openTemplateManager;
+$('#templateForm').onsubmit=async event=>{
+  event.preventDefault();const focus=[...document.querySelectorAll('.template-focus-grid input:checked')].map(input=>input.value);
+  const result=await API.save_ai_template({id:$('#templateId').value,name:$('#templateName').value,objective:$('#templateObjective').value,focus,instructions:$('#templateInstructions').value,detail:$('#templateDetail').value});
+  if(!result||!result.ok){toast(result&&result.message||'模板保存失败');return;}
+  aiTemplates=result.templates;appSettings.ai_summary_template=result.template.id;renderTemplateSelects(result.template.id);closeTemplateDialog();setTemplateSelectValue(result.template.id);toast('分析模板已保存');
+};
+
+async function aiLocalRequest(path,values){
+  if(!/^https?:$/.test(location.protocol))return null;
+  return new Promise((resolve,reject)=>{
+    const callback=`__wordgrabAi${Date.now()}${Math.random().toString(16).slice(2)}`;
+    const script=document.createElement('script');
+    const params=new URLSearchParams(values||{});params.set('callback',callback);params.set('_',Date.now());
+    const clean=()=>{clearTimeout(timer);script.remove();delete window[callback];};
+    window[callback]=result=>{clean();resolve(result);};
+    script.onerror=()=>{clean();reject(new Error('无法连接 WordGrab 本地 AI 服务'));};
+    script.src=`${path}${path.includes('?')?'&':'?'}${params}`;
+    const timer=setTimeout(()=>{clean();reject(new Error('WordGrab 本地 AI 服务响应超时'));},8000);
+    document.head.appendChild(script);
+  });
+}
+async function startAiSummaryRequest(itemId,template,privacyConfirmed){
+  return await aiLocalRequest('/ai/start',{item_id:itemId,template,privacy_confirmed:privacyConfirmed?'1':'0'})
+    ||await API.start_ai_summary(itemId,template,privacyConfirmed);
+}
+async function getAiTaskRequest(taskId){
+  return await aiLocalRequest(`/ai/task/${encodeURIComponent(taskId)}`)||await API.get_ai_task(taskId);
+}
+async function cancelAiTaskRequest(taskId){
+  return await aiLocalRequest('/ai/cancel',{task_id:taskId})||await API.cancel_ai_task(taskId);
+}
+
+function summarySourceButton(ids){
+  if(!Array.isArray(ids)||!ids.length)return '';
+  return `<button class="summary-source" type="button" data-source="${escapeHtml(ids[0])}">查看原文</button>`;
+}
+function summaryTextItem(item,key,index){
+  const value=typeof item==='string'?item:(item.text||item.summary||item.task||item.quote||item.title||'');
+  const meta=['actions','action_items'].includes(key)&&typeof item==='object'?`<div class="summary-meta">${item.owner?`<strong>${escapeHtml(item.owner)}</strong>`:''}${item.due||item.deadline?`<span>${escapeHtml(item.due||item.deadline)}</span>`:''}${item.status?`<span>${escapeHtml(item.status)}</span>`:''}</div>`:'';
+  const title=key==='topics'&&item.title?`<div class="summary-meta"><strong>${escapeHtml(item.title)}</strong></div>`:'';
+  return `<li class="summary-item">${title}${meta}<div class="summary-item-top"><p class="summary-item-text" contenteditable="true" data-summary-key="${key}" data-summary-index="${index}">${escapeHtml(value)}</p>${summarySourceButton(item.source_segment_ids)}</div></li>`;
+}
+function richGeneralSummaryHtml(result){
+  const overview=result.overview||{},speakers=Array.isArray(overview.speakers)?overview.speakers:[];
+  const overviewHtml=`<section class="summary-overview-card"><span><small>内容类型</small><strong>${escapeHtml(CONTENT_TYPE_LABELS[overview.type]||overview.type||'其他')}</strong></span><span><small>时长</small><strong>${escapeHtml(overview.duration||fmt(cur&&cur.duration))}</strong></span><span><small>参与人</small><strong>${escapeHtml(speakers.join('、')||'—')}</strong></span></section>`;
+  const list=(key,items)=>Array.isArray(items)&&items.length?`<section class="summary-section"><h3>${SUMMARY_LABELS[key]}</h3><ul class="summary-list">${items.map((item,index)=>summaryTextItem(item,key,index)).join('')}</ul></section>`:'';
+  const chapters=Array.isArray(result.chapters)&&result.chapters.length?`<section class="summary-section"><h3>${SUMMARY_LABELS.chapters}</h3><ul class="summary-chapters">${result.chapters.map(item=>`<li><button type="button" class="summary-source" data-source="${escapeHtml((item.source_segment_ids||[])[0]||'')}"><time>${escapeHtml(item.time||'')}</time><strong>${escapeHtml(item.title||'')}</strong></button></li>`).join('')}</ul></section>`:'';
+  const keywords=Array.isArray(result.keywords)&&result.keywords.length?`<section class="summary-section"><h3>${SUMMARY_LABELS.keywords}</h3><div class="summary-keywords">${result.keywords.map(item=>`<span>${escapeHtml(item)}</span>`).join('')}</div></section>`:'';
+  const highlights=Array.isArray(result.highlights)&&result.highlights.length?`<section class="summary-section"><h3>${SUMMARY_LABELS.highlights}</h3><div class="summary-highlights">${result.highlights.map(item=>`<blockquote><p>“${escapeHtml(item.quote||'')}”</p><span>${escapeHtml(item.time||'')}${summarySourceButton(item.source_segment_ids)}</span></blockquote>`).join('')}</div></section>`:'';
+  const decisions=result.decisions||{};
+  const decisionSections=[['decided','已确认决策'],['disagreements','分歧'],['open','待解问题']].map(([key,label])=>Array.isArray(decisions[key])&&decisions[key].length?`<section class="summary-section"><h3>${label}</h3><ul class="summary-list">${decisions[key].map((item,index)=>summaryTextItem(item,`decisions.${key}`,index)).join('')}</ul></section>`:'').join('');
+  return `${overviewHtml}${result.one_line_summary?`<section class="summary-section summary-one-line"><h3>${SUMMARY_LABELS.one_line_summary}</h3><p contenteditable="true" data-summary-key="one_line_summary">${escapeHtml(result.one_line_summary)}</p></section>`:''}${result.summary?`<section class="summary-section"><h3>${SUMMARY_LABELS.summary}</h3><p class="summary-long-text" contenteditable="true" data-summary-key="summary">${escapeHtml(result.summary)}</p></section>`:''}${chapters}${list('key_points',result.key_points)}${list('action_items',result.action_items)}${keywords}${highlights}${decisionSections}${list('suggestions',result.suggestions)}`;
+}
+function renderSummary(summary){
+  currentSummary=summary||null;
+  const empty=$('#aiSummaryEmpty'),content=$('#aiSummaryContent'),copy=$('#copySummaryBtn');
+  if(!summary||!summary.result){empty.classList.remove('hidden');content.classList.add('hidden');copy.classList.add('hidden');return;}
+  empty.classList.add('hidden');content.classList.remove('hidden');copy.classList.remove('hidden');
+  if(aiTemplates.some(item=>item.id===(summary.template||'general')))$('#summaryTemplate').value=summary.template||'general';
+  const result=summary.result;
+  if(summary.template!=='meeting'&&result.overview&&typeof result.overview==='object'){
+    content.innerHTML=`<div class="summary-heading"><span><h2>${escapeHtml(result.overview.title||'智能分析')}</h2><p>${escapeHtml(summary.template_name||'通用摘要')} · ${escapeHtml(summary.model||'AI')} · ${escapeHtml((summary.updated_at||summary.created_at||'').replace('T',' '))}</p></span>${summary.edited?'<span class="summary-edited">已人工编辑</span>':''}</div>${summary.quality_warning?`<div class="summary-quality-warning">${escapeHtml(summary.quality_warning)}，建议核对或重新生成。</div>`:''}${richGeneralSummaryHtml(result)}`;
+    content.querySelectorAll('.summary-source').forEach(button=>button.onclick=()=>jumpToSummarySource(button.dataset.source));
+    content.querySelectorAll('[contenteditable="true"]').forEach(element=>element.onblur=()=>saveSummaryEdit(element));
+    return;
+  }
+  const order=summary.template==='meeting'?['purpose','topics','conclusions','decisions','actions','risks']:['overview','key_points','important_information','next_steps'];
+  const sections=order.map(key=>{
+    const value=result[key];if(value==null||(Array.isArray(value)&&!value.length)||value==='')return '';
+    if(Array.isArray(value))return `<section class="summary-section"><h3>${SUMMARY_LABELS[key]}</h3><ul class="summary-list">${value.map((item,index)=>summaryTextItem(item,key,index)).join('')}</ul></section>`;
+    return `<section class="summary-section"><h3>${SUMMARY_LABELS[key]}</h3><p contenteditable="true" data-summary-key="${key}">${escapeHtml(String(value))}</p></section>`;
+  }).join('');
+  content.innerHTML=`<div class="summary-heading"><span><h2>${escapeHtml(summary.template_name||(summary.template==='meeting'?'会议纪要':'通用摘要'))}</h2><p>${escapeHtml(summary.model||'AI')} · ${escapeHtml((summary.updated_at||summary.created_at||'').replace('T',' '))}</p></span>${summary.edited?'<span class="summary-edited">已人工编辑</span>':''}</div>${sections}`;
+  content.querySelectorAll('.summary-source').forEach(button=>button.onclick=()=>jumpToSummarySource(button.dataset.source));
+  content.querySelectorAll('[contenteditable="true"]').forEach(element=>element.onblur=()=>saveSummaryEdit(element));
+}
+async function saveSummaryEdit(element){
+  if(!currentSummary||!cur)return;
+  const key=element.dataset.summaryKey,index=element.dataset.summaryIndex,text=element.textContent.trim();
+  const path=key.split('.'),leaf=path.pop();let target=currentSummary.result;
+  path.forEach(part=>{target=target&&target[part];});
+  if(!target)return;
+  if(index==null)target[leaf]=text;
+  else{
+    const items=target[leaf];if(!Array.isArray(items))return;
+    const item=items[Number(index)];
+    if(typeof item==='string')items[Number(index)]=text;
+    else if(key==='topics')item.summary=text;
+    else if(['actions','action_items'].includes(key))item.task=text;
+    else item.text=text;
+  }
+  const saved=await API.save_ai_summary(cur.id,currentSummary.result);
+  if(saved&&saved.ok){currentSummary=saved.summary;toast('总结已保存');}
+}
+function jumpToSummarySource(source){
+  const index=Number(String(source||'').replace('seg-',''));
+  if(!cur||!Number.isInteger(index)||!cur.segments[index])return;
+  setView('transcript');audio.currentTime=(cur.segments[index].start||0)/1000;
+  const element=document.querySelector(`.seg[data-idx="${index}"]`);
+  if(element){element.classList.add('active');element.scrollIntoView({block:'center',behavior:'smooth'});}
+}
+async function loadCurrentSummary(){
+  if(!cur||!API.get_ai_summary)return;
+  try{renderSummary(await API.get_ai_summary(cur.id));}catch(_){renderSummary(null);toast('暂时无法读取 AI 总结');}
+}
+async function beginSummary(privacyConfirmed=false){
+  if(!cur){toast('请先选择一份文稿');return;}
+  $('#cancelSummaryBtn').textContent='取消';$('#cancelSummaryBtn').onclick=cancelActiveAiTask;
+  const buttons=[$('#generateSummaryBtn'),$('#summaryEmptyAction')];
+  buttons.forEach(button=>{button.disabled=true;button.dataset.originalText=button.textContent;button.textContent='正在检查…';});
+  try{
+    if(!API||typeof API.start_ai_summary!=='function')throw new Error('AI 服务尚未连接');
+    const template=$('#summaryTemplate').value;
+    const result=await Promise.race([
+      startAiSummaryRequest(cur.id,template,privacyConfirmed),
+      new Promise((_,reject)=>setTimeout(()=>reject(new Error('读取 AI 配置超时，请重新保存 API Key')),7000)),
+    ]);
+    if(!result||!result.ok){
+      if(result&&['AI_NOT_CONFIGURED','AI_KEY_MISSING'].includes(result.code)){
+        setSettingsOpen(true);showSettingsPage('ai');await loadAiSettings();
+        toast('请填写 API Key 并保存设置');return;
+      }
+      if(result&&result.code==='AI_PRIVACY_CONFIRM_REQUIRED'){
+        const confirmed=await confirmSettingsAction('发送当前文稿',`WordGrab 将把当前文稿文字发送到 ${result.host}。不会发送原始音频、其他文稿或本地文件。`,'同意并生成');
+        if(confirmed)await beginSummary(true);return;
+      }
+      toast(result&&result.message||'无法生成总结');return;
+    }
+    activeAiTask=result.task_id;setAiRunning(true,'正在准备文稿',0);clearInterval(aiTaskTimer);aiTaskTimer=setInterval(pollAiTask,700);pollAiTask();
+  }catch(error){
+    const message=error&&error.message?error.message:String(error||'未知错误');
+    if(message.includes('AI 配置超时')){setSettingsOpen(true);showSettingsPage('ai');}
+    toast('无法启动 AI 总结：'+message);
+  }finally{
+    buttons.forEach(button=>{button.textContent=button.dataset.originalText||'生成 AI 总结';delete button.dataset.originalText;});
+    if(!activeAiTask)buttons.forEach(button=>button.disabled=false);
+  }
+}
+function setAiRunning(running,stage='',percent=0,elapsed=0){
+  $('#aiSummaryStatus').classList.toggle('hidden',!running);$('#generateSummaryBtn').disabled=running;$('#summaryEmptyAction').disabled=running;
+  if(stage)$('#aiSummaryStage').textContent=stage;
+  const waiting=running&&percent<=0;
+  $('#aiSummaryProgress').textContent=running?`${percent>0?Math.round(percent)+'% · ':''}已等待 ${Math.max(0,Math.round(elapsed))} 秒`:'';
+  const fill=$('#aiSummaryMeterFill');fill.classList.toggle('indeterminate',waiting);fill.style.width=waiting?'32%':`${Math.max(0,Math.min(100,percent))}%`;
+  fill.classList.remove('error');
+}
+function setAiFailure(message){
+  $('#aiSummaryStatus').classList.remove('hidden');$('#generateSummaryBtn').disabled=false;$('#summaryEmptyAction').disabled=false;
+  $('#aiSummaryStage').textContent='生成失败';$('#aiSummaryProgress').textContent=message||'AI 服务未返回有效结果';
+  const fill=$('#aiSummaryMeterFill');fill.classList.remove('indeterminate');fill.classList.add('error');fill.style.width='100%';
+  const button=$('#cancelSummaryBtn');button.textContent='关闭';button.onclick=()=>$('#aiSummaryStatus').classList.add('hidden');
+}
+async function cancelActiveAiTask(){if(activeAiTask)await cancelAiTaskRequest(activeAiTask);}
+async function pollAiTask(){
+  if(!activeAiTask)return;
+  const task=await getAiTaskRequest(activeAiTask);const percent=(Number(task.current)||0)/Math.max(1,Number(task.total)||1)*100;
+  setAiRunning(['queued','running'].includes(task.status),task.stage||'正在生成',percent,Number(task.elapsed_seconds)||0);
+  if(task.status==='done'){clearInterval(aiTaskTimer);activeAiTask='';setAiRunning(false);renderSummary(task.summary);toast('AI 总结已生成');}
+  if(task.status==='error'){clearInterval(aiTaskTimer);activeAiTask='';setAiFailure(task.message);toast(task.message||'生成失败');}
+  if(task.status==='cancelled'){clearInterval(aiTaskTimer);activeAiTask='';setAiRunning(false);toast(task.message||'总结已取消');}
+}
+$('#generateSummaryBtn').onclick=()=>beginSummary(false);$('#summaryEmptyAction').onclick=()=>beginSummary(false);
+$('#cancelSummaryBtn').onclick=cancelActiveAiTask;
+$('#summaryTemplate').onchange=event=>{
+  const value=event.target.value;
+  appSettings.ai_summary_template=value;
+};
+$('#copySummaryBtn').onclick=async()=>{if(!currentSummary)return;const text=$('#aiSummaryContent').innerText;try{await navigator.clipboard.writeText(text);toast('总结已复制');}catch(_){toast('复制失败');}};
 
 /* ---------- 导入 / 转写 ---------- */
 async function doImport(){
@@ -653,7 +1068,7 @@ $('#importBtn').onclick=doImport;
 $('#importBtn2').onclick=doImport;
 function setExportMenuOpen(open){$('#exportMenu').classList.toggle('hidden',!open);$('#exportBtn').setAttribute('aria-expanded',open?'true':'false');}
 $('#exportBtn').onclick=event=>{event.stopPropagation();setExportMenuOpen($('#exportBtn').getAttribute('aria-expanded')!=='true');};
-document.querySelectorAll('.export-option').forEach(option=>option.onclick=async event=>{event.stopPropagation();setExportMenuOpen(false);if(!cur)return;try{const path=await API.export_document(cur.id,option.dataset.format);if(path)toast('已导出：'+path.split('/').pop());}catch(error){toast('导出失败：'+error);}});
+document.querySelectorAll('.export-option').forEach(option=>option.onclick=async event=>{event.stopPropagation();setExportMenuOpen(false);if(!cur)return;try{const summaryView=$('#readingGrid').dataset.view==='summary';if(summaryView&&!currentSummary){toast('请先生成 AI 总结');return;}const path=summaryView&&API.export_ai_summary?await API.export_ai_summary(cur.id,option.dataset.format):await API.export_document(cur.id,option.dataset.format);if(path)toast('已导出：'+path.split('/').pop());}catch(error){toast('导出失败：'+error);}});
 $('#deleteBtn').onclick=async()=>{
   if(!cur)return;
   const extra=appSettings.delete_audio_with_transcript?'文稿和原始录音都会删除。':'文稿会删除，原始录音会保留。';
@@ -829,6 +1244,8 @@ function createPreviewApi(){
       {spk:1,start:134000,text:'可以。学历不是唯一判断标准，我们会更关注实习经历中真正做过什么，以及遇到困难时怎么推进。'},
     ],
   };
+  let previewSummary=null;
+  let previewTemplates=[{id:'general',name:'通用摘要',builtin:true,objective:'完整分析录音内容',focus:['内容概述','关键结论'],detail:'standard'}];
   return {
     async list_items(){return items;},
     async open_item(id){return {...sample,id,title:(items.find(x=>x.id===id)||items[0]).title};},
@@ -844,6 +1261,8 @@ function createPreviewApi(){
     async clear_history(){const count=items.length;items=[];return {ok:true,count};},
     async clear_model_cache(){return {ok:true,freed:3.1*1024**3};},
     async export_document(id,format){return `/tmp/WordGrab-demo.${format||previewSettings.export_format}`;},
+    async export_ai_summary(id,format){return `/tmp/WordGrab-demo-AI分析.${format||previewSettings.export_format}`;},
+    async reveal_item_resource(id,resource){return {ok:false,code:'EXPORT_NOT_FOUND',needs_export:true,message:'请先导出'};},
     async export_txt(){return '/tmp/WordGrab-demo.txt';},
     async log(){return true;},
     async pick_file(){return null;},
@@ -856,6 +1275,18 @@ function createPreviewApi(){
     async start_transcribe(){return null;},
     async get_settings(){return {...previewSettings};},
     async update_settings(patch){previewSettings={...previewSettings,...patch};return {...previewSettings};},
+    async get_ai_settings(){return {base_url:'https://example.com/v1',model:'summary-model',summary_template:'general',key_configured:true,key_last4:'8K2M'};},
+    async list_ai_templates(){return previewTemplates;},
+    async save_ai_template(values){const item={...values,id:values.id||'custom-demo',builtin:false};previewTemplates=[...previewTemplates.filter(x=>x.id!==item.id),item];return {ok:true,template:item,templates:previewTemplates};},
+    async delete_ai_template(id){previewTemplates=previewTemplates.filter(x=>x.id!==id);return {ok:true,templates:previewTemplates};},
+    async save_ai_settings(values){return {ok:true,...values,key_last4:'8K2M'};},
+    async list_ai_models(){return {ok:true,models:['summary-model','fast-model']};},
+    async test_ai_connection(values){return {ok:true,model:values.model||'summary-model',elapsed:0.8};},
+    async get_ai_summary(){return previewSummary;},
+    async save_ai_summary(id,result){previewSummary={...previewSummary,result,edited:true};return {ok:true,summary:previewSummary};},
+    async start_ai_summary(id,template,confirmed){if(!confirmed)return {ok:false,code:'AI_PRIVACY_CONFIRM_REQUIRED',host:'example.com'};previewSummary={template,model:'summary-model',created_at:'2026-07-17T12:00:00',updated_at:'2026-07-17T12:00:00',edited:false,result:template==='meeting'?{purpose:'对齐推广管培生的招聘标准与后续安排',topics:[{title:'候选人标准',summary:'更关注执行力、学习速度和跨团队沟通能力。',source_segment_ids:['seg-0']}],conclusions:[{text:'学历不是唯一判断标准。',source_segment_ids:['seg-3']}],decisions:[{text:'面试增加真实推广场景题。',source_segment_ids:['seg-2']}],actions:[{owner:'招聘团队',task:'补充场景题及评价标准',deadline:'',source_segment_ids:['seg-2']}],risks:[]}:{overview:'会议对齐了推广管培生的核心能力要求、轮岗安排和面试设计。',key_points:[{text:'重点考察执行力、学习速度和跨团队沟通能力。',source_segment_ids:['seg-0']}],important_information:[{text:'岗位前两个月轮岗，之后进入具体业务方向。',source_segment_ids:['seg-1']}],next_steps:[{text:'增加真实推广场景题。',source_segment_ids:['seg-2']}]}};return {ok:true,task_id:'preview-ai'};},
+    async get_ai_task(){return {status:'done',current:1,total:1,stage:'总结已完成',summary:previewSummary};},
+    async cancel_ai_task(){return {ok:true};},
     async set_theme(theme){
       previewSettings.theme=theme;try{localStorage.setItem('wordgrab-theme',theme);}catch(_){ }
       return true;

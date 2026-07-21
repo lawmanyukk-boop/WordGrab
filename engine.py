@@ -58,24 +58,57 @@ _MODEL_LOCK = threading.Lock()  # 预加载线程与转写线程可能同时进�
 
 
 def get_model(progress=None):
-    """懒加载单例模型（冷启动约 30-40 秒，app 启动时可后台预加载）"""
+    """懒加载单例模型（冷启动约 30-40 秒，app 启动时可后台预加载）
+
+    首次运行会自动下载约 2GB 模型文件，支持进度提示
+    """
     global _MODEL
     if _MODEL is None:
         with _MODEL_LOCK:
             if _MODEL is None:
-                if progress:
-                    progress("加载模型…", None)
-                import torch
-                from funasr import AutoModel
-                device = "mps" if torch.backends.mps.is_available() else "cpu"
-                _MODEL = AutoModel(
-                    model="paraformer-zh",
-                    vad_model="fsmn-vad",
-                    punc_model="ct-punc",
-                    spk_model="cam++",
-                    disable_update=True,
-                    device=device,
+                # 检查模型是否需要下载
+                cache_dir = os.path.expanduser("~/.cache/modelscope")
+                model_exists = os.path.isdir(cache_dir) and any(
+                    os.path.isdir(os.path.join(cache_dir, d))
+                    for d in ["hub", "models"]
+                    if os.path.isdir(os.path.join(cache_dir, d))
                 )
+
+                if not model_exists and progress:
+                    # 首次下载，显示下载进度
+                    try:
+                        from model_downloader import ModelDownloadMonitor
+                        monitor = ModelDownloadMonitor(progress)
+                        monitor.start_monitoring()
+                    except ImportError:
+                        monitor = None
+                else:
+                    monitor = None
+
+                try:
+                    if progress:
+                        progress("正在加载模型…", None, {"status": "loading"})
+
+                    import torch
+                    from funasr import AutoModel
+                    device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+                    _MODEL = AutoModel(
+                        model="paraformer-zh",
+                        vad_model="fsmn-vad",
+                        punc_model="ct-punc",
+                        spk_model="cam++",
+                        disable_update=True,
+                        device=device,
+                    )
+
+                    if progress:
+                        progress("模型加载完成", 1.0, {"status": "ready"})
+
+                finally:
+                    if monitor:
+                        monitor.stop_monitoring()
+
     return _MODEL
 
 

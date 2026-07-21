@@ -5,6 +5,7 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_DIR="${1:-$PROJECT_ROOT/WordGrab.app}"
 CONTENTS_DIR="$APP_DIR/Contents"
+RUNTIME_ROOT="$HOME/Library/Application Support/录音转文字"
 
 if [[ ! -f "$PROJECT_ROOT/app.py" ]]; then
   echo "找不到 app.py，请从项目目录运行此脚本。" >&2
@@ -17,6 +18,7 @@ if [[ ! -f "$PROJECT_ROOT/assets/icon.icns" ]]; then
 fi
 
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
+rm -f "$CONTENTS_DIR/MacOS/WordGrab-bin"
 cp "$PROJECT_ROOT/assets/icon.icns" "$CONTENTS_DIR/Resources/icon.icns"
 
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
@@ -37,15 +39,13 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1.2.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>无需麦克风</string>
 </dict>
 </plist>
 PLIST
@@ -53,9 +53,12 @@ PLIST
 # 尝试把 Python 解释器复制进 bundle：进程可执行文件位于 .app 内，
 # macOS 才会把运行中的进程认作本应用（否则 Dock 显示 Python 的火箭图标和名字）。
 BUNDLED_BIN=""
-VENV_PY="$PROJECT_ROOT/.venv/bin/python"
-if [[ -x "$VENV_PY" ]]; then
-  BASE="$("$VENV_PY" -c 'import sys; print(sys.base_exec_prefix)' 2>/dev/null || true)"
+PY_SOURCE=""
+for CANDIDATE in "$PROJECT_ROOT/.venv/bin/python" "$RUNTIME_ROOT/.venv/bin/python" "$(command -v python3 || true)"; do
+  if [[ -n "$CANDIDATE" && -x "$CANDIDATE" ]]; then PY_SOURCE="$CANDIDATE"; break; fi
+done
+if [[ -n "$PY_SOURCE" ]]; then
+  BASE="$("$PY_SOURCE" -c 'import sys; print(sys.base_exec_prefix)' 2>/dev/null || true)"
   REAL="$BASE/Resources/Python.app/Contents/MacOS/Python"   # framework 构建的真实解释器
   if [[ -f "$REAL" && -f "$BASE/Python3" ]]; then
     cp "$REAL" "$CONTENTS_DIR/MacOS/WordGrab-bin"
@@ -70,16 +73,13 @@ if [[ -x "$VENV_PY" ]]; then
     echo "已内嵌解释器（Dock 图标/名字将显示为本应用）"
   fi
 fi
-SITE_PACKAGES="$(ls -d "$PROJECT_ROOT"/.venv/lib/python*/site-packages 2>/dev/null | head -1 || true)"
-
 # App 源码放在 Application Support，避免 macOS 对桌面目录的应用访问限制。
-RUNTIME_ROOT="$HOME/Library/Application Support/录音转文字"
 mkdir -p "$RUNTIME_ROOT/ui" "$RUNTIME_ROOT/assets"
-cp "$PROJECT_ROOT/app.py" "$PROJECT_ROOT/engine.py" "$PROJECT_ROOT/transcribe.py" "$PROJECT_ROOT/requirements.txt" "$PROJECT_ROOT/README.md" "$RUNTIME_ROOT/"
+cp "$PROJECT_ROOT/app.py" "$PROJECT_ROOT/ai_service.py" "$PROJECT_ROOT/engine.py" "$PROJECT_ROOT/transcribe.py" "$PROJECT_ROOT/requirements.txt" "$PROJECT_ROOT/README.md" "$RUNTIME_ROOT/"
 cp -R "$PROJECT_ROOT/ui/." "$RUNTIME_ROOT/ui/"
 cp -R "$PROJECT_ROOT/assets/." "$RUNTIME_ROOT/assets/"
 
-# RUNTIME_ROOT / SITE_PACKAGES 在生成时展开；其余变量留给 App 启动时解析。
+# 生成启动脚本；运行时再定位虚拟环境依赖目录。
 cat > "$CONTENTS_DIR/MacOS/launcher" <<LAUNCHER
 #!/usr/bin/env bash
 DIR="\$(cd "\$(dirname "\$0")" && pwd)"
@@ -88,8 +88,15 @@ cd "\$PROJECT_ROOT" || exit 1
 export MODELSCOPE_CACHE="\$HOME/.cache/modelscope"
 mkdir -p "\$PROJECT_ROOT/data"
 
-PYTHON="\$PROJECT_ROOT/.venv/bin/python"
-# 优先使用完整虚拟环境，确保 torch / FunASR 等依赖可用。
+PYTHON="\$DIR/WordGrab-bin"
+VENV_SITE="\$(find "\$PROJECT_ROOT/.venv/lib" -maxdepth 2 -type d -name site-packages 2>/dev/null | head -1)"
+# 优先使用 App 包内的可执行文件，确保 macOS 将进程识别为 WordGrab；
+# 依赖仍从完整虚拟环境读取，不影响转写与 AI 功能。
+if [[ -x "\$PYTHON" && -n "\$VENV_SITE" ]]; then
+  export PYTHONPATH="\$VENV_SITE\${PYTHONPATH:+:\$PYTHONPATH}"
+else
+  PYTHON="\$PROJECT_ROOT/.venv/bin/python"
+fi
 if [[ ! -x "\$PYTHON" ]]; then
   PYTHON="\$(command -v python3 || true)"
 fi

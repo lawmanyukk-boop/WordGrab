@@ -22,7 +22,7 @@
 
   <!-- 侧边栏 -->
   <aside class="sidebar">
-    <button id="importBtn" class="btn-primary">
+    <button id="importBtn" class="btn-primary" style="margin-bottom: 8px;">
       <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M11 5a1 1 0 1 1 2 0v6h6a1 1 0 1 1 0 2h-6v6a1 1 0 1 1-2 0v-6H5a1 1 0 1 1 0-2h6V5z"/></svg>
       导入音频
     </button>
@@ -62,8 +62,7 @@
       <header class="topbar">
         <div class="view-tabs" role="tablist" aria-label="文稿视图">
           <button class="view-tab active" type="button" role="tab" data-view="transcript">文稿</button>
-          <button class="view-tab" type="button" role="tab" data-view="speakers">说话人</button>
-          <button class="view-tab" type="button" role="tab" data-view="file">文件信息</button>
+          <button class="view-tab" type="button" role="tab" data-view="summary">AI 总结</button>
         </div>
         <div class="doc-actions">
           <div class="mini-search">
@@ -98,9 +97,24 @@
         <div id="readingGrid" class="reading-grid" data-view="transcript">
           <div id="transcript" class="transcript"></div>
 
+          <section id="aiSummary" class="ai-summary" aria-label="AI 总结">
+            <header class="ai-summary-toolbar">
+              <label><span>分析模板</span><select id="summaryTemplate"><option value="general">通用摘要</option></select></label>
+              <div class="ai-summary-actions"><button id="copySummaryBtn" class="btn-ghost hidden" type="button">复制全部</button><button id="generateSummaryBtn" class="ai-primary" type="button">生成 AI 总结</button></div>
+            </header>
+            <div id="aiSummaryStatus" class="ai-summary-status hidden"><span><i></i><strong id="aiSummaryStage">正在准备文稿</strong><small id="aiSummaryProgress">正在连接</small></span><button id="cancelSummaryBtn" type="button">取消</button><div class="ai-summary-meter"><i id="aiSummaryMeterFill"></i></div></div>
+            <div id="aiSummaryEmpty" class="ai-summary-empty">
+              <span class="ai-summary-mark" aria-hidden="true">✦</span>
+              <h2>把长文稿整理成清晰结论</h2>
+              <p>使用你配置的 AI 接口生成摘要。只发送当前文稿文字，不发送原始音频。</p>
+              <button id="summaryEmptyAction" class="ai-primary" type="button">生成 AI 总结</button>
+            </div>
+            <div id="aiSummaryContent" class="ai-summary-content hidden"></div>
+          </section>
+
           <aside class="inspector" aria-label="说话人与文件信息">
             <section class="inspector-section speaker-inspector">
-              <div class="inspector-title"><strong>说话人</strong><span>点击可改名</span></div>
+              <div class="inspector-title"><strong>说话人</strong><span>双击名称可改名</span></div>
               <div id="speakerList" class="speaker-list"></div>
             </section>
             <section class="inspector-section file-inspector">
@@ -181,6 +195,7 @@
       <nav aria-label="设置分类">
         <button class="settings-nav-item active" type="button" data-settings-page="general">通用</button>
         <button class="settings-nav-item" type="button" data-settings-page="transcription">转写与导出</button>
+        <button class="settings-nav-item" type="button" data-settings-page="ai">AI 服务</button>
         <button class="settings-nav-item" type="button" data-settings-page="appearance">外观</button>
         <button class="settings-nav-item" type="button" data-settings-page="storage">存储与隐私</button>
         <button class="settings-nav-item" type="button" data-settings-page="about">关于</button>
@@ -285,6 +300,20 @@
           </div>
         </section>
 
+        <section class="settings-page" data-settings-content="ai">
+          <div class="ai-setting-intro"><span aria-hidden="true">✦</span><div><strong>使用你自己的 AI 接口</strong><p>支持 OpenAI 兼容服务。转写仍在本地完成，生成总结时只发送当前文稿文字。</p></div></div>
+          <h3 class="setting-section-title">连接</h3>
+          <div class="setting-group ai-setting-group">
+            <label class="setting-field"><span><strong>接口地址</strong><small>填写服务商提供的 Base URL</small></span><input id="aiBaseUrl" type="url" placeholder="https://example.com/v1" autocomplete="off"></label>
+            <label class="setting-field"><span><strong>API Key</strong><small id="aiKeyHint">仅保存在本机，不会上传或写入项目</small></span><input id="aiApiKey" type="password" placeholder="输入或保留现有 Key" autocomplete="new-password"></label>
+            <label class="setting-field"><span><strong>模型</strong><small>点「获取模型」列出可用模型，点击选择；也可手动填写</small></span><span class="setting-inline-input"><input id="aiModel" list="aiModelList" placeholder="模型名称" autocomplete="off"><button id="loadAiModels" class="setting-action" type="button">获取模型</button></span><datalist id="aiModelList"></datalist></label>
+            <div id="aiModelChips" class="ai-model-chips hidden" role="listbox" aria-label="可用模型"></div>
+            <label class="setting-row"><span><strong>默认分析模板</strong><small>生成时仍可临时切换</small></span><select id="aiDefaultTemplate"><option value="general">通用摘要</option></select></label>
+            <div class="setting-row"><span><strong>自定义分析模板</strong><small id="aiTemplateCount">尚未创建自定义模板</small></span><button id="manageAiTemplates" class="setting-action" type="button">新建与管理</button></div>
+          </div>
+          <div class="ai-setting-footer"><span id="aiConnectionStatus">尚未测试连接</span><div><button id="testAiConnection" class="setting-action" type="button">测试连接</button><button id="saveAiSettings" class="settings-done" type="button">保存设置</button></div></div>
+        </section>
+
         <section class="settings-page settings-theme-page" data-settings-content="themes">
           <button id="themeBackBtn" class="settings-back" type="button">‹ 返回外观</button>
           <div class="theme-page-heading"><strong>主题</strong><small>同时应用到侧边栏和界面强调色，选择后自动保存</small></div>
@@ -292,7 +321,7 @@
         </section>
 
         <section class="settings-page" data-settings-content="storage">
-          <div class="privacy-card"><strong>所有音频均在本地处理</strong><p>WordGrab 不会上传录音、文稿或设置。</p></div>
+          <div class="privacy-card"><strong>录音与转写均在本地处理</strong><p>只有在你主动生成 AI 总结时，当前文稿文字才会发送到所配置的服务。</p></div>
           <h3 class="setting-section-title">文稿与录音</h3>
           <div class="setting-group">
             <div class="setting-row">
@@ -332,7 +361,51 @@
     </div>
   </section>
 
-  <div id="settingsConfirm" class="settings-confirm hidden" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
+</div>
+
+<div id="historyContextMenu" class="context-menu hidden" role="menu" aria-label="文稿操作">
+  <button type="button" role="menuitem" data-context-action="rename">重命名</button>
+  <div class="context-submenu-host">
+    <button type="button" role="menuitem" aria-haspopup="menu">导出<span aria-hidden="true">›</span></button>
+    <div class="context-submenu" role="menu" aria-label="导出">
+      <button type="button" role="menuitem" data-context-action="export-document">导出文稿</button>
+      <button type="button" role="menuitem" data-context-action="export-summary">导出 AI 总结</button>
+    </div>
+  </div>
+  <div class="context-submenu-host">
+    <button type="button" role="menuitem" aria-haspopup="menu">在 Finder 中显示<span aria-hidden="true">›</span></button>
+    <div class="context-submenu" role="menu" aria-label="在 Finder 中显示">
+      <button type="button" role="menuitem" data-context-action="reveal-document">在 Finder 中显示文稿</button>
+      <button type="button" role="menuitem" data-context-action="reveal-summary">在 Finder 中显示 AI 总结</button>
+    </div>
+  </div>
+  <i class="context-separator" aria-hidden="true"></i>
+  <button class="danger" type="button" role="menuitem" data-context-action="delete">删除文稿</button>
+</div>
+
+<div id="templateOverlay" class="confirm-overlay hidden">
+  <section class="template-dialog" role="dialog" aria-modal="true" aria-labelledby="templateDialogTitle">
+    <header><span><h2 id="templateDialogTitle">新建分析模板</h2><p>用自然语言告诉 AI 你想如何整理录音</p></span><button id="closeTemplateDialog" type="button" aria-label="关闭">×</button></header>
+    <div id="templateManager" class="template-manager hidden"></div>
+    <form id="templateForm" class="template-form">
+      <input id="templateId" type="hidden">
+      <label><span>模板名称</span><input id="templateName" maxlength="30" placeholder="例如：招聘讨论分析" required></label>
+      <label><span>分析目标</span><textarea id="templateObjective" rows="3" placeholder="例如：分析招聘标准、候选人要求、已确认决定和后续行动" required></textarea></label>
+      <fieldset><legend>重点关注</legend><div class="template-focus-grid">
+        <label><input type="checkbox" value="内容概述" checked><span>内容概述</span></label><label><input type="checkbox" value="关键结论" checked><span>关键结论</span></label>
+        <label><input type="checkbox" value="重要信息" checked><span>重要信息</span></label><label><input type="checkbox" value="决策与共识" checked><span>决策与共识</span></label>
+        <label><input type="checkbox" value="行动项" checked><span>行动项</span></label><label><input type="checkbox" value="风险与待确认问题"><span>风险与待确认</span></label>
+        <label><input type="checkbox" value="后续建议"><span>后续建议</span></label><label><input type="checkbox" value="重要原话"><span>重要原话</span></label>
+      </div></fieldset>
+      <label><span>高级提示词 / 补充要求 <small>可选，无需粘贴录音内容</small></span><textarea id="templateInstructions" rows="3" placeholder="例如：区分应届生和社招标准，不要遗漏负责人和地点"></textarea></label>
+      <label><span>输出详略</span><select id="templateDetail"><option value="concise">精简</option><option value="standard" selected>标准</option><option value="detailed">详细</option></select></label>
+      <footer><button id="cancelTemplate" class="btn-ghost" type="button">取消</button><button class="ai-primary" type="submit">保存模板</button></footer>
+    </form>
+  </section>
+</div>
+
+<div id="confirmOverlay" class="confirm-overlay hidden">
+  <div id="settingsConfirm" class="settings-confirm" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
     <h3 id="confirmTitle">确认操作</h3><p id="confirmMessage"></p>
     <div><button id="confirmCancel" type="button">取消</button><button id="confirmAccept" class="danger" type="button">确认</button></div>
   </div>

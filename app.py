@@ -4,6 +4,7 @@
 左侧历史 + 文稿点读联动 + 播放器 + 说话人改名 + 搜索 + 导出
 """
 import os, sys, json, time, uuid, shutil, threading, datetime, re, subprocess, hashlib, sqlite3
+import ai_service
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,7 +36,7 @@ INDEX = os.path.join(DATA, "index.json")
 SETTINGS = os.path.join(DATA, "settings.json")
 TRASH = os.path.join(DATA, ".trash")
 INDEX_DB = os.path.join(DATA, "index.db")
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 THEME_KEYS = {
     "aurora-sea", "solar-bloom", "lavender-haze", "tide-ember",
@@ -60,6 +61,10 @@ DEFAULT_SETTINGS = {
     "follow_system": False,
     "delete_audio_with_transcript": True,
     "last_item_id": "",
+    "ai_base_url": "",
+    "ai_model": "",
+    "ai_summary_template": "general",
+    "ai_privacy_host": "",
 }
 
 SETTING_ENUMS = {
@@ -84,6 +89,8 @@ MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB，避免误拖入超大视频�
 
 # 转写进度共享给前端轮询（后台线程只写这个 dict，不从子线程调 evaluate_js —— 后者在 macOS 上易崩）
 PROGRESS = {}                      # iid -> {stage, pct, info, status, msg, title, partial}
+AI_TASKS = {}                      # task_id -> AI 总结任务状态
+AI_TASKS_LOCK = threading.RLock()
 TRANSCRIBE_LOCK = threading.Lock()  # 序列化转写，避免并发共用同一个模型实例出错
 DELETED = set()                    # 转写期间被用户删除的 iid，两阶段落盘前都要检查
 _DRAG_STRIP_CLASS = None           # macOS 原生透明拖动带（延迟创建，避免非 macOS 导入 AppKit）
@@ -91,6 +98,15 @@ _DRAG_STRIPS = {}                  # NSWindow id -> drag view，持有引用避�
 _DRAG_OBSERVERS = {}               # NSWindow id -> 通知监听状态，缩放/全屏后重新定位拖动带
 
 # ---------- 历史存储 ----------
+
+def atomic_write_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as file:
+        json.dump(value, file, ensure_ascii=False, indent=2)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temporary, path)
 
 def load_index():
     with INDEX_LOCK:
@@ -184,6 +200,9 @@ def normalize_settings(data=None):
                 "delete_audio_with_transcript"):
         out[key] = bool(out[key])
     out["last_item_id"] = str(out.get("last_item_id") or "")
+    out["ai_base_url"] = str(out.get("ai_base_url") or "").strip().rstrip("/")
+    out["ai_model"] = str(out.get("ai_model") or "").strip()
+    out["ai_privacy_host"] = str(out.get("ai_privacy_host") or "")
     directory = os.path.expanduser(str(out.get("export_directory") or ""))
     out["export_directory"] = directory if os.path.isdir(directory) else os.path.expanduser("~/Documents")
     return out
@@ -491,6 +510,105 @@ def export_payload(iid):
         "participants_text": participants_text,
         "rows": rows,
     }
+
+
+def ai_summary_export_payload(iid):
+    base = export_payload(iid)
+    source_title = base["title"]
+    summary = ai_service.load_summary(item_dir(iid))
+    if not summary or not isinstance(summary.get("result"), dict):
+        raise ValueError("当前文稿还没有可导出的 AI 总结")
+    result = summary["result"]
+    data = load_item(iid)
+    segments = data.get("segments") or []
+    colors = EXPORT_COLORS
+
+    def source_time(value):
+        ids = []
+        def collect(child):
+            if isinstance(child, dict):
+                raw = child.get("source_segment_ids")
+                if isinstance(raw, list): ids.extend(raw)
+                for nested in child.values(): collect(nested)
+            elif isinstance(child, list):
+                for nested in child: collect(nested)
+        collect(value)
+        for source in ids:
+            match = re.fullmatch(r"seg-(\d+)", str(source))
+            if match and int(match.group(1)) < len(segments):
+                return format_export_time(segments[int(match.group(1))].get("start") or 0)
+        return "00:00"
+
+    def item_text(item):
+        if isinstance(item, str): return item.strip()
+        if not isinstance(item, dict): return ""
+        text = str(item.get("text") or item.get("summary") or item.get("quote")
+                   or item.get("title") or item.get("task") or "").strip()
+        details = []
+        if item.get("owner"): details.append("负责人：" + str(item["owner"]))
+        if item.get("due") or item.get("deadline"): details.append("截止：" + str(item.get("due") or item.get("deadline")))
+        if item.get("status"): details.append("状态：" + str(item["status"]))
+        when = item.get("time")
+        if when: details.append("时间：" + str(when))
+        return text + (("（" + "；".join(details) + "）") if details else "")
+
+    sections = []
+    def add(label, value):
+        if value in (None, "", []): return
+        if isinstance(value, list):
+            text = "\n".join(f"• {item_text(item)}" for item in value if item_text(item))
+        elif isinstance(value, dict):
+            text = "\n".join(f"{key}：{item_text(item)}" for key, item in value.items() if item_text(item))
+        else: text = str(value).strip()
+        if text: sections.append((label, text, source_time(value)))
+
+    if summary.get("template") == "meeting":
+        add("会议目的", result.get("purpose")); add("讨论主题", result.get("topics"))
+        add("关键结论", result.get("conclusions")); add("已确认决策", result.get("decisions"))
+        add("待办事项", result.get("actions")); add("风险与待确认", result.get("risks"))
+    else:
+        overview = result.get("overview") or {}
+        if isinstance(overview, dict):
+            type_names = {"meeting":"会议","interview":"访谈","lecture":"讲座","call":"通话","memo":"备忘","other":"其他"}
+            overview_text = "\n".join(filter(None, [
+                "分析标题：" + str(overview.get("title") or ""),
+                "内容类型：" + type_names.get(overview.get("type"), str(overview.get("type") or "其他")),
+                "时长：" + str(overview.get("duration") or base["duration_text"]),
+                "参与人：" + "、".join(str(x) for x in (overview.get("speakers") or [])),
+            ]))
+            add("概览", overview_text)
+        else: add("概览", overview)
+        add("一句话总结", result.get("one_line_summary"))
+        add("智能摘要", result.get("summary"))
+        add("章节脉络", result.get("chapters"))
+        add("关键信息 / 要点", result.get("key_points"))
+        add("待办与行动项", result.get("action_items"))
+        add("关键词", "、".join(str(x) for x in (result.get("keywords") or [])))
+        add("亮点 / 金句", result.get("highlights"))
+        decisions = result.get("decisions") or {}
+        if isinstance(decisions, dict):
+            add("已确认决策", decisions.get("decided")); add("分歧", decisions.get("disagreements")); add("待解问题", decisions.get("open"))
+        add("后续建议", result.get("suggestions"))
+
+    rows = []
+    for index, (label, text, start_time) in enumerate(sections):
+        rows.append({"speaker_index": index, "speaker": label, "start_ms": 0, "end_ms": 0,
+                     "start_time": start_time, "end_time": start_time, "time": start_time,
+                     "text": text, "color": colors[index % len(colors)]})
+    analysis_title = ((result.get("overview") or {}).get("title")
+                      if isinstance(result.get("overview"), dict) else "")
+    base["title"] = f"{base['title']} · {analysis_title or 'AI 分析'}"
+    base["participants_text"] = "AI 内容分析"
+    base["rows"] = rows
+    base["word_count"] = sum(1 for row in rows for char in row["text"] if not char.isspace())
+    base["word_count_text"] = f"{base['word_count']:,} 字"
+    base["is_ai_analysis"] = True
+    base["source_title"] = source_title
+    base["analysis_title"] = analysis_title or "AI 内容分析"
+    base["template_name"] = summary.get("template_name") or ("会议纪要" if summary.get("template") == "meeting" else "通用摘要")
+    base["ai_result"] = result
+    base["ai_template"] = summary.get("template") or "general"
+    return base
 
 
 def write_txt_export(path, payload):
@@ -998,8 +1116,533 @@ def write_pdf_export(path, payload):
     document.build(story, onFirstPage=draw_page_number, onLaterPages=draw_page_number)
 
 
+def write_ai_pdf_export(path, payload):
+    """AI 分析专用报告版式：不复用说话人逐段稿结构。"""
+    from html import escape
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import (HRFlowable, Image, KeepTogether, Paragraph,
+                                   SimpleDocTemplate, Spacer, Table, TableStyle)
+
+    font_name, bold_font = "WordGrabReport", "WordGrabReportBold"
+
+    def register_font(name, candidates):
+        if name in pdfmetrics.getRegisteredFontNames(): return name
+        for filename, subfont_index in candidates:
+            if os.path.isfile(filename):
+                try:
+                    pdfmetrics.registerFont(TTFont(name, filename, subfontIndex=subfont_index))
+                    return name
+                except Exception:
+                    pass
+        return None
+
+    if not register_font(font_name, (("/System/Library/Fonts/STHeiti Light.ttc", 0),
+                                     ("/System/Library/Fonts/STHeiti Medium.ttc", 0))):
+        font_name = "STSong-Light"; pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+    if not register_font(bold_font, (("/System/Library/Fonts/STHeiti Medium.ttc", 0),
+                                     ("/System/Library/Fonts/STHeiti Light.ttc", 0))):
+        bold_font = font_name
+
+    ink = colors.HexColor("#191919")
+    muted = colors.HexColor("#808080")
+    accent = colors.HexColor("#12B981")
+    secondary = colors.HexColor("#FF9F0A")
+    line = colors.HexColor("#D9D9D9")
+    soft = colors.white
+    blue_soft = colors.HexColor("#F2FBF7")
+    green_soft = colors.HexColor("#EFF9F3")
+    amber_soft = colors.HexColor("#FFF8E8")
+
+    styles = {
+        "eyebrow": ParagraphStyle("AiEyebrow", fontName=bold_font, fontSize=10.5, leading=14,
+                                  textColor=accent, spaceAfter=7),
+        "title": ParagraphStyle("AiTitle", fontName=bold_font, fontSize=23, leading=31,
+                                textColor=ink, spaceAfter=8, wordWrap="CJK"),
+        "subtitle": ParagraphStyle("AiSubtitle", fontName=font_name, fontSize=10.5, leading=16,
+                                   textColor=muted, spaceAfter=19, wordWrap="CJK"),
+        "section": ParagraphStyle("AiSection", fontName=bold_font, fontSize=15, leading=21,
+                                  textColor=accent, spaceBefore=17, spaceAfter=9, keepWithNext=True,
+                                  wordWrap="CJK"),
+        "body": ParagraphStyle("AiBody", fontName=font_name, fontSize=11.2, leading=19,
+                               textColor=ink, spaceAfter=8, wordWrap="CJK"),
+        "bullet": ParagraphStyle("AiBullet", fontName=font_name, fontSize=11, leading=18,
+                                 leftIndent=14, firstLineIndent=-10, textColor=ink,
+                                 spaceAfter=6, wordWrap="CJK"),
+        "number": ParagraphStyle("AiNumber", fontName=font_name, fontSize=11, leading=18,
+                                 leftIndent=23, firstLineIndent=-19, textColor=ink,
+                                 spaceAfter=7, wordWrap="CJK"),
+        "meta": ParagraphStyle("AiMeta", fontName=font_name, fontSize=9.3, leading=14,
+                               textColor=muted, wordWrap="CJK"),
+        "quote": ParagraphStyle("AiQuote", fontName=font_name, fontSize=10.8, leading=18,
+                                leftIndent=12, rightIndent=8, textColor=ink,
+                                spaceAfter=5, wordWrap="CJK"),
+        "callout": ParagraphStyle("AiCallout", fontName=bold_font, fontSize=12.2, leading=20,
+                                  textColor=ink, wordWrap="CJK"),
+        "footer": ParagraphStyle("AiFooter", fontName=font_name, fontSize=8.5, leading=11,
+                                 textColor=muted, alignment=TA_CENTER),
+    }
+
+    def clean(value):
+        text = str(value or "").strip()
+        text = re.sub(r"seg-\d+(?:\s*[~～-]\s*seg-\d+)?", "", text, flags=re.I)
+        # 综合摘要中的时间证据只用于内部追溯，报告正文不重复展示。
+        text = re.sub(r"[（(][0-9:~～\-，,；;、\s]+[）)]", "", text)
+        text = re.sub(r"([,，;；]\s*)+[）)]", "）", text)
+        text = re.sub(r"[（(]\s*[）)]", "", text)
+        text = re.sub(r"\s+([，。；：！？、）])", r"\1", text)
+        text = re.sub(r"（\s+", "（", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"[，,；;]\s*[，,；;]", "，", text)
+        text = re.sub(r"\s+。", "。", text)
+        return text.strip(" ，,;；")
+
+    def item_text(item):
+        if isinstance(item, str): return clean(item)
+        if not isinstance(item, dict): return ""
+        return clean(item.get("text") or item.get("summary") or item.get("quote")
+                     or item.get("title") or item.get("task"))
+
+    result = payload.get("ai_result") if isinstance(payload.get("ai_result"), dict) else {}
+    overview = result.get("overview") if isinstance(result.get("overview"), dict) else {}
+    story = []
+
+    icon_path = os.path.join(UI, "icon_1024.png")
+    brand = [[Image(icon_path, 38, 38) if os.path.isfile(icon_path) else "",
+              Paragraph("WordGrab", ParagraphStyle("Brand", parent=styles["body"],
+                                                     fontName="Helvetica-Bold", fontSize=22, leading=27))]]
+    brand_table = Table(brand, colWidths=[45, 180], hAlign="LEFT")
+    brand_table.setStyle(TableStyle([("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                                     ("LEFTPADDING", (0,0), (-1,-1), 0),
+                                     ("RIGHTPADDING", (0,0), (-1,-1), 0),
+                                     ("TOPPADDING", (0,0), (-1,-1), 0),
+                                     ("BOTTOMPADDING", (0,0), (-1,-1), 0)]))
+    stripe = Table([[""] * len(EXPORT_COLORS)], colWidths=[514 / len(EXPORT_COLORS)] * len(EXPORT_COLORS),
+                   rowHeights=[9], hAlign="LEFT")
+    stripe_style = [("BACKGROUND", (index, 0), (index, 0), colors.HexColor(color))
+                    for index, color in enumerate(EXPORT_COLORS)]
+    stripe.setStyle(TableStyle(stripe_style + [("LEFTPADDING", (0,0), (-1,-1), 0),
+                                                ("RIGHTPADDING", (0,0), (-1,-1), 0),
+                                                ("TOPPADDING", (0,0), (-1,-1), 0),
+                                                ("BOTTOMPADDING", (0,0), (-1,-1), 0)]))
+    story += [brand_table, Spacer(1, 11), stripe, Spacer(1, 18), Paragraph("AI 内容分析报告", styles["eyebrow"]),
+              Paragraph(escape(clean(overview.get("title") or payload.get("analysis_title") or payload.get("source_title"))), styles["title"]),
+              Paragraph(escape(clean(payload.get("source_title"))), styles["subtitle"])]
+
+    type_names = {"meeting":"会议", "interview":"访谈", "lecture":"讲座",
+                  "call":"通话", "memo":"备忘", "other":"其他"}
+    speakers = "、".join(str(x) for x in (overview.get("speakers") or [])) or "—"
+    metadata = [
+        ["录制时间", payload.get("recorded_text") or "—", "录音时长", overview.get("duration") or payload.get("duration_text") or "—"],
+        ["内容类型", type_names.get(overview.get("type"), overview.get("type") or "其他"), "参与人", speakers],
+        ["分析模板", payload.get("template_name") or "通用摘要", "分析字数", payload.get("word_count_text") or "—"],
+    ]
+    meta_data = [[Paragraph(escape(clean(cell)), styles["meta"] if col % 2 == 0 else styles["body"])
+                  for col, cell in enumerate(row)] for row in metadata]
+    meta_table = Table(meta_data, colWidths=[63, 194, 63, 194], hAlign="LEFT")
+    meta_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), soft), ("BOX", (0,0), (-1,-1), .55, colors.HexColor("#222222")),
+        ("INNERGRID", (0,0), (-1,-1), .45, colors.HexColor("#222222")), ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 4), ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story += [meta_table, Spacer(1, 18)]
+
+    one_line = clean(result.get("one_line_summary"))
+    if one_line:
+        callout = Table([[Paragraph(escape(one_line), styles["callout"])]], colWidths=[514])
+        callout.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), blue_soft),
+                                     ("LINEBEFORE", (0,0), (0,-1), 5, accent),
+                                     ("LEFTPADDING", (0,0), (-1,-1), 14), ("RIGHTPADDING", (0,0), (-1,-1), 14),
+                                     ("TOPPADDING", (0,0), (-1,-1), 12), ("BOTTOMPADDING", (0,0), (-1,-1), 12)]))
+        story += [Paragraph("核心结论", styles["section"]), callout]
+
+    section_index = 0
+
+    def section_heading(title):
+        nonlocal section_index
+        module_color = colors.HexColor(EXPORT_COLORS[section_index % len(EXPORT_COLORS)])
+        section_index += 1
+        heading = Table([[Paragraph(escape(title), styles["section"])]], colWidths=[514])
+        heading.setStyle(TableStyle([
+            ("LINEBEFORE", (0, 0), (0, -1), 6, module_color),
+            ("LEFTPADDING", (0, 0), (-1, -1), 13),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LINEBELOW", (0, 0), (-1, -1), .5, line),
+        ]))
+        story.extend([Spacer(1, 7), heading, Spacer(1, 9)])
+
+    def add_paragraphs(title, value):
+        text = clean(value)
+        if not text: return
+        section_heading(title)
+        parts = [clean(part) for part in re.split(r"\n+", text) if clean(part)]
+        story.extend(Paragraph(escape(part), styles["body"]) for part in parts)
+
+    def add_items(title, items, numbered=False, background=None):
+        values = [item for item in (items or []) if item_text(item)] if isinstance(items, list) else []
+        if not values: return
+        section_heading(title)
+        for index, item in enumerate(values, 1):
+            text = item_text(item)
+            when = clean(item.get("time")) if isinstance(item, dict) else ""
+            prefix = f"{index}." if numbered else "•"
+            suffix = f' <font color="#7A808B">{escape(when)}</font>' if when else ""
+            paragraph = Paragraph(f'<font color="#12B981"><b>{prefix}</b></font> {escape(text)}{suffix}',
+                                  styles["number"] if numbered else styles["bullet"])
+            if background:
+                box = Table([[paragraph]], colWidths=[514])
+                box.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), background),
+                                         ("LEFTPADDING", (0,0), (-1,-1), 11), ("RIGHTPADDING", (0,0), (-1,-1), 11),
+                                         ("TOPPADDING", (0,0), (-1,-1), 8), ("BOTTOMPADDING", (0,0), (-1,-1), 4)]))
+                story.extend([box, Spacer(1, 5)])
+            else:
+                story.append(paragraph)
+
+    add_paragraphs("分析摘要", result.get("summary"))
+    add_items("内容脉络", result.get("chapters"), numbered=True)
+    add_items("关键信息", result.get("key_points"))
+
+    actions = result.get("action_items") if isinstance(result.get("action_items"), list) else []
+    if actions:
+        section_heading("行动项")
+        for index, item in enumerate(actions, 1):
+            task = item_text(item); details = []
+            if isinstance(item, dict) and item.get("owner"): details.append("负责人：" + clean(item["owner"]))
+            due = clean(item.get("due") or item.get("deadline")) if isinstance(item, dict) else ""
+            if due and due not in {"未明确", "待确认"}: details.append("截止：" + due)
+            body = Paragraph(f'<b>{index}. {escape(task)}</b>' + (f'<br/><font color="#717784">{escape("　".join(details))}</font>' if details else ""), styles["body"])
+            box = Table([[body]], colWidths=[514])
+            box.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), green_soft),
+                                     ("BOX", (0,0), (-1,-1), .45, colors.HexColor("#D6ECDD")),
+                                     ("LEFTPADDING", (0,0), (-1,-1), 12), ("RIGHTPADDING", (0,0), (-1,-1), 12),
+                                     ("TOPPADDING", (0,0), (-1,-1), 9), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
+            story.extend([box, Spacer(1, 6)])
+
+    decisions = result.get("decisions") if isinstance(result.get("decisions"), dict) else {}
+    add_items("已确认决策", decisions.get("decided"), background=green_soft)
+    add_items("分歧与不同观点", decisions.get("disagreements"), background=amber_soft)
+    add_items("待确认问题", decisions.get("open"), background=amber_soft)
+
+    keywords = [clean(x) for x in (result.get("keywords") or []) if clean(x)]
+    if keywords:
+        section_heading("关键词")
+        story.append(Paragraph(escape("　·　".join(keywords)), styles["body"]))
+
+    highlights = result.get("highlights") if isinstance(result.get("highlights"), list) else []
+    if highlights:
+        section_heading("重要原话")
+        for item in highlights:
+            quote = item_text(item)
+            if not quote: continue
+            when = clean(item.get("time")) if isinstance(item, dict) else ""
+            story.append(KeepTogether([Paragraph("“" + escape(quote) + "”", styles["quote"]),
+                                       Paragraph(escape(when), styles["meta"]) if when else Spacer(1, 0)]))
+            story.append(Spacer(1, 7))
+    add_items("后续建议", result.get("suggestions"), numbered=True)
+
+    document = SimpleDocTemplate(path, pagesize=A4, leftMargin=40, rightMargin=41,
+                                 topMargin=15, bottomMargin=40, title=payload.get("analysis_title") or "AI 内容分析",
+                                 author="WordGrab", subject="WordGrab AI 内容分析报告")
+
+    def page_furniture(canvas, doc):
+        canvas.saveState()
+        if doc.page > 1:
+            canvas.setStrokeColor(line); canvas.setLineWidth(.5); canvas.line(40, A4[1] - 27, A4[0] - 41, A4[1] - 27)
+            canvas.setFont(font_name, 8.5); canvas.setFillColor(muted)
+            canvas.drawString(40, A4[1] - 21, clean(payload.get("analysis_title") or "AI 内容分析"))
+        canvas.setFillColor(ink); canvas.circle(46, 16, 5, stroke=0, fill=1)
+        canvas.setFont("Helvetica-Bold", 14); canvas.setFillColor(muted)
+        canvas.drawString(58, 10, "WordGrab")
+        canvas.setFont(font_name, 8.5)
+        canvas.drawRightString(A4[0] - 41, 18, str(doc.page))
+        canvas.restoreState()
+
+    document.build(story, onFirstPage=page_furniture, onLaterPages=page_furniture)
+
+
+def write_ai_docx_export(path, payload):
+    """AI 分析专用 Word 报告，与品牌 PDF 保持同一视觉系统。"""
+    from docx import Document
+    from docx.enum.section import WD_SECTION
+    from docx.enum.table import WD_ALIGN_VERTICAL, WD_ROW_HEIGHT_RULE, WD_TABLE_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Mm, Pt, RGBColor
+
+    document = Document()
+    section = document.sections[0]
+    section.page_width, section.page_height = Mm(210), Mm(297)
+    section.left_margin, section.right_margin = Mm(14.1), Mm(14.5)
+    section.top_margin, section.bottom_margin = Mm(5.3), Mm(14.1)
+    body_font, brand_font = "Arial Unicode MS", "Arial"
+    ink, muted, accent, secondary, line = "191919", "808080", "12B981", "FF9F0A", "D9D9D9"
+
+    def clean(value):
+        text = str(value or "").strip()
+        text = re.sub(r"seg-\d+(?:\s*[~～-]\s*seg-\d+)?", "", text, flags=re.I)
+        text = re.sub(r"[（(][0-9:~～\-，,；;、\s]+[）)]", "", text)
+        text = re.sub(r"([,，;；]\s*)+[）)]", "）", text)
+        text = re.sub(r"[（(]\s*[）)]", "", text)
+        text = re.sub(r"\s+([，。；：！？、）])", r"\1", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        return text.strip(" ，,;；")
+
+    def set_run(run, size=10.5, color=ink, bold=False, name=body_font):
+        run.font.name = name; run.font.size = Pt(size); run.font.bold = bold
+        run.font.color.rgb = RGBColor.from_string(color)
+        fonts = run._element.get_or_add_rPr().rFonts
+        if fonts is None:
+            fonts = OxmlElement("w:rFonts"); run._element.get_or_add_rPr().insert(0, fonts)
+        for key in ("ascii", "hAnsi", "eastAsia"): fonts.set(qn(f"w:{key}"), name)
+
+    def shade(cell, color):
+        props = cell._tc.get_or_add_tcPr(); node = props.find(qn("w:shd"))
+        if node is None: node = OxmlElement("w:shd"); props.append(node)
+        node.set(qn("w:fill"), color)
+
+    def cell_margins(cell, top=90, start=120, bottom=90, end=120):
+        props = cell._tc.get_or_add_tcPr(); margins = props.find(qn("w:tcMar"))
+        if margins is None: margins = OxmlElement("w:tcMar"); props.append(margins)
+        for tag, value in (("top",top),("start",start),("bottom",bottom),("end",end)):
+            node = margins.find(qn(f"w:{tag}"))
+            if node is None: node = OxmlElement(f"w:{tag}"); margins.append(node)
+            node.set(qn("w:w"), str(value)); node.set(qn("w:type"), "dxa")
+
+    def borders(cell, color=line, size="4", value="single"):
+        props = cell._tc.get_or_add_tcPr(); box = props.find(qn("w:tcBorders"))
+        if box is None: box = OxmlElement("w:tcBorders"); props.append(box)
+        for edge in ("top","left","bottom","right","insideH","insideV"):
+            node = box.find(qn(f"w:{edge}"))
+            if node is None: node = OxmlElement(f"w:{edge}"); box.append(node)
+            node.set(qn("w:val"), value); node.set(qn("w:sz"), size); node.set(qn("w:color"), color)
+
+    def no_borders(table):
+        for row in table.rows:
+            for cell in row.cells: borders(cell, value="nil")
+
+    def set_width(cell, width_mm):
+        width = int(Mm(width_mm).emu / 635)
+        tcw = cell._tc.get_or_add_tcPr().find(qn("w:tcW"))
+        if tcw is None: tcw = OxmlElement("w:tcW"); cell._tc.get_or_add_tcPr().append(tcw)
+        tcw.set(qn("w:w"), str(width)); tcw.set(qn("w:type"), "dxa")
+
+    def paragraph(text="", size=10.5, color=ink, bold=False, before=0, after=5, leading=1.45):
+        p = document.add_paragraph(); p.paragraph_format.space_before = Pt(before)
+        p.paragraph_format.space_after = Pt(after); p.paragraph_format.line_spacing = leading
+        set_run(p.add_run(clean(text)), size, color, bold); return p
+
+    def tiny_spacer(points=3):
+        p = document.add_paragraph(); p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0); p.paragraph_format.line_spacing = Pt(points)
+        set_run(p.add_run("\u200b"), 1, "FFFFFF")
+
+    section_index = 0
+
+    def section_heading(title):
+        nonlocal section_index
+        module_color = EXPORT_COLORS[section_index % len(EXPORT_COLORS)].lstrip("#")
+        section_index += 1
+        p = document.add_paragraph(); p.paragraph_format.space_before = Pt(13)
+        p.paragraph_format.space_after = Pt(7); p.paragraph_format.keep_with_next = True
+        set_run(p.add_run(title), 14, accent, True)
+        p.paragraph_format.left_indent = Mm(4)
+        props = p._p.get_or_add_pPr(); box = OxmlElement("w:pBdr")
+        left = OxmlElement("w:left"); left.set(qn("w:val"), "single"); left.set(qn("w:sz"), "28")
+        left.set(qn("w:color"), module_color); left.set(qn("w:space"), "8"); box.append(left)
+        bottom = OxmlElement("w:bottom")
+        bottom.set(qn("w:val"), "single"); bottom.set(qn("w:sz"), "4"); bottom.set(qn("w:color"), line)
+        bottom.set(qn("w:space"), "6"); box.append(bottom); props.append(box)
+
+    def item_text(item):
+        if isinstance(item, str): return clean(item)
+        if not isinstance(item, dict): return ""
+        return clean(item.get("text") or item.get("summary") or item.get("quote")
+                     or item.get("title") or item.get("task"))
+
+    def fresh_numbering_id():
+        numbering = document.part.numbering_part.element
+        style_num_id = document.styles["List Number"]._element.pPr.numPr.numId.val
+        source_num = next(node for node in numbering.findall(qn("w:num"))
+                          if node.get(qn("w:numId")) == str(style_num_id))
+        abstract_id = source_num.find(qn("w:abstractNumId")).get(qn("w:val"))
+        used = [int(node.get(qn("w:numId"))) for node in numbering.findall(qn("w:num"))]
+        new_id = max(used or [0]) + 1
+        num = OxmlElement("w:num"); num.set(qn("w:numId"), str(new_id))
+        abstract = OxmlElement("w:abstractNumId"); abstract.set(qn("w:val"), abstract_id); num.append(abstract)
+        override = OxmlElement("w:lvlOverride"); override.set(qn("w:ilvl"), "0")
+        start = OxmlElement("w:startOverride"); start.set(qn("w:val"), "1"); override.append(start); num.append(override)
+        numbering.append(num); return new_id
+
+    def add_list(title, items, numbered=False, fill=None):
+        values = [item for item in (items or []) if item_text(item)] if isinstance(items, list) else []
+        if not values: return
+        section_heading(title)
+        number_id = fresh_numbering_id() if numbered else None
+        for index, item in enumerate(values, 1):
+            text, when = item_text(item), clean(item.get("time")) if isinstance(item, dict) else ""
+            if fill:
+                table = document.add_table(rows=1, cols=1); table.alignment = WD_TABLE_ALIGNMENT.LEFT
+                cell = table.cell(0,0); shade(cell, fill); borders(cell, color="D6ECDD" if fill=="EFF9F3" else "F1DFC0")
+                cell_margins(cell, 110, 150, 100, 150); p = cell.paragraphs[0]
+                set_run(p.add_run("• "), 10.5, accent, True); set_run(p.add_run(text), 10.5)
+                if when: set_run(p.add_run("  " + when), 9.2, muted)
+                tiny_spacer()
+            else:
+                p = document.add_paragraph(style="List Number" if numbered else "List Bullet")
+                if numbered:
+                    num_pr = p._p.get_or_add_pPr().get_or_add_numPr()
+                    num_pr.get_or_add_ilvl().val = 0; num_pr.get_or_add_numId().val = number_id
+                p.paragraph_format.left_indent = Mm(5.5); p.paragraph_format.first_line_indent = Mm(-3.5)
+                p.paragraph_format.space_after = Pt(4); p.paragraph_format.line_spacing = 1.35
+                set_run(p.add_run(text), 10.5)
+                if when: set_run(p.add_run("  " + when), 9.2, muted)
+
+    result = payload.get("ai_result") if isinstance(payload.get("ai_result"), dict) else {}
+    overview = result.get("overview") if isinstance(result.get("overview"), dict) else {}
+
+    # 品牌标头：Logo + WordGrab + 彩色条，与转写 PDF 保持一致。
+    brand = document.add_table(rows=1, cols=2); brand.alignment = WD_TABLE_ALIGNMENT.LEFT; brand.autofit = False
+    brand.columns[0].width = Mm(14); brand.columns[1].width = Mm(145)
+    brand.cell(0,0).width = Mm(14); brand.cell(0,1).width = Mm(145); no_borders(brand)
+    for cell in brand.row_cells(0): cell_margins(cell, 0, 0, 0, 0); cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    icon = os.path.join(UI, "icon_1024.png")
+    brand.cell(0,0).paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
+    brand.cell(0,1).paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.LEFT
+    if os.path.isfile(icon): brand.cell(0,0).paragraphs[0].add_run().add_picture(icon, width=Mm(12), height=Mm(12))
+    set_run(brand.cell(0,1).paragraphs[0].add_run("WordGrab"), 22, ink, True, brand_font)
+
+    stripe = document.add_table(rows=1, cols=len(EXPORT_COLORS)); stripe.alignment = WD_TABLE_ALIGNMENT.LEFT
+    stripe.rows[0].height = Pt(8); stripe.rows[0].height_rule = WD_ROW_HEIGHT_RULE.EXACTLY
+    for cell, color in zip(stripe.rows[0].cells, EXPORT_COLORS):
+        shade(cell, color.lstrip("#")); borders(cell, color="FFFFFF", size="6"); cell_margins(cell,0,0,0,0)
+    document.add_paragraph().paragraph_format.space_after = Pt(0)
+
+    p = document.add_paragraph(); p.paragraph_format.space_before = Pt(5); p.paragraph_format.space_after = Pt(3)
+    set_run(p.add_run("AI 内容分析报告"), 9.5, accent, True)
+    p = document.add_paragraph(); p.paragraph_format.space_after = Pt(3)
+    set_run(p.add_run(clean(overview.get("title") or payload.get("analysis_title") or payload.get("source_title"))), 23, ink, True)
+    p = document.add_paragraph(); p.paragraph_format.space_after = Pt(12)
+    set_run(p.add_run(clean(payload.get("source_title"))), 10, muted)
+
+    type_names = {"meeting":"会议","interview":"访谈","lecture":"讲座","call":"通话","memo":"备忘","other":"其他"}
+    speakers = "、".join(str(x) for x in (overview.get("speakers") or [])) or "—"
+    meta = [
+        ["录制时间", payload.get("recorded_text") or "—", "录音时长", overview.get("duration") or payload.get("duration_text") or "—"],
+        ["内容类型", type_names.get(overview.get("type"), overview.get("type") or "其他"), "参与人", speakers],
+        ["分析模板", payload.get("template_name") or "通用摘要", "分析字数", payload.get("word_count_text") or "—"],
+    ]
+    table = document.add_table(rows=3, cols=4); table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    widths = [24, 62, 24, 62]
+    for r, values in enumerate(meta):
+        for c, value in enumerate(values):
+            cell=table.cell(r,c); set_width(cell,widths[c]); shade(cell,"FFFFFF"); borders(cell,color="222222",size="4")
+            cell_margins(cell,55,65,55,65); cell.vertical_alignment=WD_ALIGN_VERTICAL.CENTER
+            p=cell.paragraphs[0]; set_run(p.add_run(clean(value)),9 if c%2==0 else 10,muted if c%2==0 else ink,False)
+
+    one_line = clean(result.get("one_line_summary"))
+    if one_line:
+        section_heading("核心结论")
+        box=document.add_table(rows=1,cols=1); cell=box.cell(0,0); shade(cell,"F2FBF7"); borders(cell,color=accent)
+        cell_margins(cell,150,180,150,180); set_run(cell.paragraphs[0].add_run(one_line),12,ink,True)
+
+    summary=clean(result.get("summary"))
+    if summary:
+        section_heading("分析摘要")
+        for part in [clean(x) for x in re.split(r"\n+",summary) if clean(x)]: paragraph(part)
+    add_list("内容脉络",result.get("chapters"),numbered=True)
+    add_list("关键信息",result.get("key_points"))
+
+    actions=result.get("action_items") if isinstance(result.get("action_items"),list) else []
+    if actions:
+        section_heading("行动项")
+        for index,item in enumerate(actions,1):
+            table=document.add_table(rows=1,cols=1); cell=table.cell(0,0); shade(cell,"EFF9F3"); borders(cell,color="D6ECDD")
+            cell_margins(cell,120,160,110,160); p=cell.paragraphs[0]
+            set_run(p.add_run(f"{index}. {item_text(item)}"),10.5,ink,True)
+            details=[]
+            if isinstance(item,dict) and item.get("owner"): details.append("负责人："+clean(item["owner"]))
+            due=clean(item.get("due") or item.get("deadline")) if isinstance(item,dict) else ""
+            if due and due not in {"未明确","待确认"}: details.append("截止："+due)
+            if details: p.add_run("\n"); set_run(p.add_run("　".join(details)),9.2,muted)
+            tiny_spacer()
+
+    decisions=result.get("decisions") if isinstance(result.get("decisions"),dict) else {}
+    add_list("已确认决策",decisions.get("decided"),fill="EFF9F3")
+    add_list("分歧与不同观点",decisions.get("disagreements"),fill="FFF8E8")
+    add_list("待确认问题",decisions.get("open"),fill="FFF8E8")
+
+    keywords=[clean(x) for x in (result.get("keywords") or []) if clean(x)]
+    if keywords: section_heading("关键词"); paragraph("　·　".join(keywords))
+    highlights=result.get("highlights") if isinstance(result.get("highlights"),list) else []
+    if highlights:
+        section_heading("重要原话")
+        for item in highlights:
+            quote=item_text(item)
+            if not quote: continue
+            p=paragraph("“"+quote+"”",10.5,ink,False,0,4)
+            p.paragraph_format.left_indent=Mm(5)
+            when=clean(item.get("time")) if isinstance(item,dict) else ""
+            if when: set_run(p.add_run("  " + when),9,muted)
+    add_list("后续建议",result.get("suggestions"),numbered=True)
+
+    footer=section.footer
+    footer.paragraphs[0]._element.getparent().remove(footer.paragraphs[0]._element)
+    footer_table=footer.add_table(rows=1,cols=2,width=Mm(181)); footer_table.autofit=False
+    footer_table.columns[0].width=Mm(150); footer_table.columns[1].width=Mm(31)
+    footer_table.cell(0,0).width=Mm(150); footer_table.cell(0,1).width=Mm(31); no_borders(footer_table)
+    for cell in footer_table.rows[0].cells: cell_margins(cell,0,0,0,0)
+    left=footer_table.cell(0,0).paragraphs[0]
+    set_run(left.add_run("●  WordGrab"),12,muted,True,brand_font)
+    right=footer_table.cell(0,1).paragraphs[0]; right.alignment=WD_ALIGN_PARAGRAPH.RIGHT
+    fld=OxmlElement("w:fldSimple"); fld.set(qn("w:instr"),"PAGE"); right._p.append(fld)
+
+    document.core_properties.title=clean(payload.get("analysis_title") or "AI 内容分析")
+    document.core_properties.subject="WordGrab AI 内容分析报告"
+    document.core_properties.author="WordGrab"
+    document.save(path)
+
+
 def item_dir(iid):
     return os.path.join(DATA, iid)
+
+
+def record_export_path(iid, resource, path):
+    """记录最近一次用户导出的成品文件，不暴露内部 JSON 存储。"""
+    if resource not in {"document", "summary"} or not path:
+        return
+    record_path = os.path.join(item_dir(iid), "exports.json")
+    try:
+        with open(record_path, encoding="utf-8") as file:
+            records = json.load(file)
+        if not isinstance(records, dict):
+            records = {}
+    except (OSError, ValueError, TypeError):
+        records = {}
+    records[resource] = {
+        "path": os.path.abspath(os.path.expanduser(str(path))),
+        "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    atomic_write_json(record_path, records)
+
+
+def latest_export_path(iid, resource):
+    if resource not in {"document", "summary"}:
+        return None
+    try:
+        with open(os.path.join(item_dir(iid), "exports.json"), encoding="utf-8") as file:
+            value = json.load(file).get(resource)
+        return value.get("path") if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def load_item(iid):
@@ -1089,6 +1732,38 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _send_json(self, value, status=200):
+        body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_jsonp(self, callback, value):
+        if not re.fullmatch(r"[A-Za-z_$][\w$\.]{0,120}", callback or ""):
+            return self.send_error(400, "无效的回调名称")
+        body = f"{callback}({json.dumps(value, ensure_ascii=False)});".encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/javascript; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            raise ValueError("无效的请求大小")
+        if length < 0 or length > 65536:
+            raise ValueError("请求内容过大")
+        if not length:
+            return {}
+        value = json.loads(self.rfile.read(length).decode("utf-8"))
+        return value if isinstance(value, dict) else {}
+
     def _send_file(self, path, ctype):
         try:
             size = os.path.getsize(path)
@@ -1124,7 +1799,10 @@ class Handler(BaseHTTPRequestHandler):
                 remaining -= len(chunk)
 
     def do_GET(self):
-        path = self.path.split("?")[0]
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         if path == "/" or path == "/index.html":
             return self._send_file(os.path.join(UI, "index.html"), "text/html; charset=utf-8")
         if path.startswith("/static/"):
@@ -1158,12 +1836,44 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if path.startswith("/ai/task/") and API_REF is not None:
+            task_id = path.split("/ai/task/", 1)[1]
+            result = API_REF.get_ai_task(task_id)
+            callback = query.get("callback", [""])[0]
+            return self._send_jsonp(callback, result) if callback else self._send_json(result)
+        if path == "/ai/start" and API_REF is not None:
+            result = API_REF.start_ai_summary(
+                query.get("item_id", [""])[0], query.get("template", ["general"])[0],
+                query.get("privacy_confirmed", ["0"])[0] == "1",
+            )
+            callback = query.get("callback", [""])[0]
+            return self._send_jsonp(callback, result) if callback else self._send_json(result)
+        if path == "/ai/cancel" and API_REF is not None:
+            result = API_REF.cancel_ai_task(query.get("task_id", [""])[0])
+            callback = query.get("callback", [""])[0]
+            return self._send_jsonp(callback, result) if callback else self._send_json(result)
         self.send_error(404)
 
     def do_POST(self):
         # 拖拽上传：WebView 里拿不到文件路径，只能把字节流 POST 过来落盘再转写
         from urllib.parse import urlparse, parse_qs, unquote
         parsed = urlparse(self.path)
+        if parsed.path == "/ai/start" and API_REF is not None:
+            try:
+                values = self._read_json()
+                result = API_REF.start_ai_summary(
+                    values.get("item_id"), values.get("template", "general"),
+                    bool(values.get("privacy_confirmed", False)),
+                )
+                return self._send_json(result)
+            except (ValueError, json.JSONDecodeError) as exc:
+                return self._send_json({"ok": False, "message": str(exc)}, 400)
+        if parsed.path == "/ai/cancel" and API_REF is not None:
+            try:
+                values = self._read_json()
+                return self._send_json(API_REF.cancel_ai_task(values.get("task_id")))
+            except (ValueError, json.JSONDecodeError) as exc:
+                return self._send_json({"ok": False, "message": str(exc)}, 400)
         if parsed.path != "/upload" or API_REF is None:
             return self.send_error(404)
         q = parse_qs(parsed.query)
@@ -1241,6 +1951,237 @@ class Api:
 
     def update_settings(self, patch):
         return apply_settings_patch(patch)
+
+    # AI 总结：只支持用户配置的 OpenAI 兼容接口，Key 存在本机受限文件中。
+    def get_ai_settings(self):
+        settings = load_settings()
+        key = ai_service.load_api_key()
+        return {
+            "base_url": settings["ai_base_url"],
+            "model": settings["ai_model"],
+            "summary_template": settings["ai_summary_template"],
+            "key_configured": bool(key),
+            "key_last4": key[-4:] if key else "",
+        }
+
+    def list_ai_templates(self):
+        path = os.path.join(DATA, "ai_templates.json")
+        try:
+            with open(path, encoding="utf-8") as file:
+                custom = json.load(file)
+        except (OSError, ValueError):
+            custom = []
+        if not isinstance(custom, list):
+            custom = []
+        return [{"id": "general", "name": "通用摘要", "builtin": True,
+                 "objective": "自动识别录音内容，完整整理主题、结论、决策、行动与重要信息",
+                 "focus": ["内容概述", "关键结论", "重要信息", "决策与共识", "行动项", "风险与待确认问题", "后续建议", "关键词"],
+                 "instructions": "所有事实必须来自原文，并尽量关联时间与原文位置", "detail": "standard"}] + custom
+
+    def save_ai_template(self, values):
+        values = values if isinstance(values, dict) else {}
+        name = str(values.get("name") or "").strip()[:30]
+        objective = str(values.get("objective") or "").strip()[:2000]
+        if not name or not objective:
+            return {"ok": False, "message": "请填写模板名称和分析目标"}
+        templates = [item for item in self.list_ai_templates() if not item.get("builtin")]
+        template_id = str(values.get("id") or "").strip()
+        if not template_id or template_id == "general":
+            template_id = "custom-" + uuid.uuid4().hex[:12]
+        if any(item.get("name") == name and item.get("id") != template_id for item in templates):
+            return {"ok": False, "message": "已经存在同名模板"}
+        focus = values.get("focus") if isinstance(values.get("focus"), list) else []
+        payload = {"id": template_id, "name": name, "builtin": False,
+                   "objective": objective, "focus": [str(x).strip()[:60] for x in focus if str(x).strip()][:20],
+                   "instructions": str(values.get("instructions") or "").strip()[:3000],
+                   "detail": values.get("detail") if values.get("detail") in {"concise", "standard", "detailed"} else "standard",
+                   "updated_at": datetime.datetime.now().isoformat(timespec="seconds")}
+        replaced = False
+        for index, item in enumerate(templates):
+            if item.get("id") == template_id:
+                templates[index], replaced = payload, True
+                break
+        if not replaced:
+            templates.append(payload)
+        atomic_write_json(os.path.join(DATA, "ai_templates.json"), templates)
+        return {"ok": True, "template": payload, "templates": self.list_ai_templates()}
+
+    def delete_ai_template(self, template_id):
+        if not template_id or template_id == "general":
+            return {"ok": False, "message": "通用摘要不能删除"}
+        templates = [item for item in self.list_ai_templates()
+                     if not item.get("builtin") and item.get("id") != template_id]
+        atomic_write_json(os.path.join(DATA, "ai_templates.json"), templates)
+        if load_settings().get("ai_summary_template") == template_id:
+            apply_settings_patch({"ai_summary_template": "general"})
+        return {"ok": True, "templates": self.list_ai_templates()}
+
+    def save_ai_settings(self, values):
+        values = values if isinstance(values, dict) else {}
+        try:
+            base_url = ai_service.normalize_base_url(values.get("base_url"))
+            model = str(values.get("model") or "").strip()
+            if not model:
+                return {"ok": False, "code": "AI_MODEL_MISSING", "message": "请输入模型名称"}
+            key = str(values.get("api_key") or "").strip()
+            last4 = ai_service.save_api_key(key) if key else (ai_service.load_api_key()[-4:] or "")
+            if not last4:
+                return {"ok": False, "code": "AI_KEY_MISSING", "message": "请输入 API Key"}
+            template = str(values.get("summary_template") or "general")
+            if not any(item.get("id") == template for item in self.list_ai_templates()):
+                template = "general"
+            saved = apply_settings_patch({
+                "ai_base_url": base_url,
+                "ai_model": model,
+                "ai_summary_template": template,
+            })
+            return {"ok": True, "base_url": saved["ai_base_url"], "model": saved["ai_model"],
+                    "summary_template": saved["ai_summary_template"], "key_last4": last4}
+        except ai_service.AiServiceError as exc:
+            return {"ok": False, "code": exc.code, "message": exc.message}
+        except OSError:
+            return {"ok": False, "code": "AI_KEY_STORAGE_ERROR", "message": "无法在本机安全保存 API Key"}
+
+    def delete_ai_key(self):
+        ai_service.delete_api_key()
+        return {"ok": True}
+
+    def list_ai_models(self, base_url=None, api_key=None):
+        settings = load_settings()
+        url = str(base_url or settings["ai_base_url"] or "")
+        key = str(api_key or "").strip() or ai_service.load_api_key()
+        if not key:
+            return {"ok": False, "code": "AI_KEY_MISSING", "message": "请输入 API Key"}
+        try:
+            return {"ok": True, "models": ai_service.list_models(url, key)}
+        except ai_service.AiServiceError as exc:
+            return {"ok": False, "code": exc.code, "message": exc.message}
+
+    def test_ai_connection(self, values):
+        values = values if isinstance(values, dict) else {}
+        settings = load_settings()
+        url = str(values.get("base_url") or settings["ai_base_url"] or "")
+        model = str(values.get("model") or settings["ai_model"] or "").strip()
+        key = str(values.get("api_key") or "").strip() or ai_service.load_api_key()
+        if not key:
+            return {"ok": False, "code": "AI_KEY_MISSING", "message": "请输入 API Key"}
+        if not model:
+            return {"ok": False, "code": "AI_MODEL_MISSING", "message": "请输入模型名称"}
+        started = time.monotonic()
+        try:
+            ai_service.test_connection(url, key, model)
+            return {"ok": True, "elapsed": round(time.monotonic() - started, 1), "model": model}
+        except ai_service.AiServiceError as exc:
+            return {"ok": False, "code": exc.code, "message": exc.message}
+
+    def get_ai_summary(self, iid):
+        if not iid or not os.path.isdir(item_dir(iid)):
+            return None
+        return ai_service.load_summary(item_dir(iid))
+
+    def save_ai_summary(self, iid, result):
+        existing = self.get_ai_summary(iid)
+        if not existing or not isinstance(result, dict):
+            return {"ok": False, "message": "没有可保存的总结"}
+        existing["result"] = result
+        existing["edited"] = True
+        existing["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        ai_service.save_summary(item_dir(iid), existing)
+        return {"ok": True, "summary": existing}
+
+    def start_ai_summary(self, iid, template="general", privacy_confirmed=False):
+        if not iid or not os.path.isfile(os.path.join(item_dir(iid), "transcript.json")):
+            return {"ok": False, "code": "AI_TRANSCRIPT_MISSING", "message": "当前文稿尚未保存完成"}
+        settings = load_settings()
+        base_url, model = settings["ai_base_url"], settings["ai_model"]
+        key = ai_service.load_api_key()
+        if not base_url or not model or not key:
+            return {"ok": False, "code": "AI_NOT_CONFIGURED", "message": "请先在设置中配置 AI 服务"}
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(ai_service.normalize_base_url(base_url)).netloc
+        except ai_service.AiServiceError as exc:
+            return {"ok": False, "code": exc.code, "message": exc.message}
+        if settings.get("ai_privacy_host") != host and not privacy_confirmed:
+            return {"ok": False, "code": "AI_PRIVACY_CONFIRM_REQUIRED", "host": host,
+                    "message": "生成总结会把当前文稿文字发送到该 AI 服务"}
+        if privacy_confirmed:
+            apply_settings_patch({"ai_privacy_host": host})
+        template_config = next((item for item in self.list_ai_templates() if item.get("id") == template), None)
+        if not template_config:
+            template, template_config = "general", self.list_ai_templates()[0]
+        task_id = uuid.uuid4().hex[:16]
+        with AI_TASKS_LOCK:
+            AI_TASKS[task_id] = {"id": task_id, "item_id": iid, "status": "queued",
+                                 "stage": "正在准备文稿", "current": 0, "total": 1,
+                                 "cancelled": False, "message": "", "started_at": time.time()}
+        threading.Thread(target=self._run_ai_summary,
+                         args=(task_id, iid, template, template_config, base_url, key, model), daemon=True).start()
+        return {"ok": True, "task_id": task_id}
+
+    def _run_ai_summary(self, task_id, iid, template, template_config, base_url, key, model):
+        def cancelled():
+            with AI_TASKS_LOCK:
+                return bool(AI_TASKS.get(task_id, {}).get("cancelled"))
+
+        def progress(current, total, stage):
+            with AI_TASKS_LOCK:
+                task = AI_TASKS.get(task_id)
+                if task:
+                    task.update(status="running", current=current, total=max(1, total), stage=stage)
+        try:
+            data = load_item(iid)
+            transcript_hash = hashlib.sha256(
+                json.dumps(data.get("segments") or [], ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            result = ai_service.generate_summary(data, template_config, base_url, key, model,
+                                                 progress=progress, cancelled=cancelled)
+            quality_warning = result.pop("_quality_warning", "")
+            payload = {
+                "template": template,
+                "template_name": template_config.get("name") or "通用摘要",
+                "template_snapshot": template_config,
+                "model": model,
+                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "transcript_hash": transcript_hash,
+                "edited": False,
+                "quality_warning": quality_warning,
+                "result": result,
+            }
+            ai_service.save_summary(item_dir(iid), payload)
+            with AI_TASKS_LOCK:
+                AI_TASKS[task_id].update(status="done", current=1, total=1,
+                                         stage="总结已完成", summary=payload,
+                                         elapsed_seconds=round(time.time() - AI_TASKS[task_id]["started_at"], 1))
+            print(f"[ai] 总结完成 task={task_id} elapsed={time.time() - AI_TASKS[task_id]['started_at']:.1f}s", flush=True)
+        except ai_service.AiServiceError as exc:
+            with AI_TASKS_LOCK:
+                AI_TASKS[task_id].update(status="cancelled" if exc.code == "AI_CANCELLED" else "error",
+                                         code=exc.code, message=exc.message, stage=exc.message)
+            print(f"[ai] 总结失败 task={task_id} code={exc.code} message={exc.message}", flush=True)
+        except Exception as exc:
+            print(f"[ai] 总结失败: {exc!r}", flush=True)
+            with AI_TASKS_LOCK:
+                AI_TASKS[task_id].update(status="error", code="AI_INTERNAL_ERROR",
+                                         message="生成总结时发生内部错误", stage="生成失败")
+
+    def get_ai_task(self, task_id):
+        with AI_TASKS_LOCK:
+            task = AI_TASKS.get(task_id)
+            if not task:
+                return {"status": "unknown"}
+            result = dict(task)
+            result["elapsed_seconds"] = round(time.time() - task.get("started_at", time.time()), 1)
+            return result
+
+    def cancel_ai_task(self, task_id):
+        with AI_TASKS_LOCK:
+            if task_id in AI_TASKS:
+                AI_TASKS[task_id]["cancelled"] = True
+                AI_TASKS[task_id]["stage"] = "正在取消"
+                return {"ok": True}
+        return {"ok": False, "message": "任务不存在"}
 
     def set_theme(self, theme):
         if theme not in THEME_KEYS:
@@ -1322,6 +2263,27 @@ class Api:
             return True
         except Exception:
             return False
+
+    def reveal_item_resource(self, iid, resource):
+        """在 Finder 中定位最近一次导出的成品，而不是内部 JSON。"""
+        resource = str(resource)
+        if resource not in {"document", "summary"} or not iid:
+            return {"ok": False, "message": "无法识别要显示的文件"}
+        path = latest_export_path(str(iid), resource)
+        label = "文稿" if resource == "document" else "AI 总结"
+        if not path:
+            return {"ok": False, "code": "EXPORT_NOT_FOUND", "needs_export": True,
+                    "message": f"尚未导出{label}，请先选择保存位置"}
+        if not os.path.isfile(path):
+            return {"ok": False, "code": "EXPORT_MOVED", "needs_export": True,
+                    "message": f"上次导出的{label}已被移动或删除，请重新导出"}
+        try:
+            subprocess.Popen(["open", "-R", path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            print(f"[finder] 显示导出{label}: {path}", flush=True)
+            return {"ok": True, "path": path, "filename": os.path.basename(path)}
+        except Exception:
+            return {"ok": False, "message": "无法打开 Finder"}
 
     # 打开某条：返回合并后的分段 + 说话人名 + 音频地址
     def open_item(self, iid):
@@ -1565,6 +2527,7 @@ class Api:
                 if fmt == "txt": write_txt_export(output, payload)
                 elif fmt == "pdf": write_pdf_export(output, payload)
                 else: write_docx_export(output, payload)
+                record_export_path(iid, "document", output)
                 exported += 1
             return {"ok": True, "count": exported, "directory": directory}
         except Exception as exc:
@@ -1744,11 +2707,35 @@ class Api:
             write_pdf_export(out, payload)
         else:
             write_txt_export(out, payload)
+        record_export_path(iid, "document", out)
         return out
+
+    def export_ai_summary(self, iid, export_format=None):
+        import webview
+        settings = load_settings()
+        fmt = export_format if export_format in {"docx", "pdf", "txt"} else settings["export_format"]
+        payload = ai_summary_export_payload(iid)
+        title = safe_filename(payload["title"])
+        if settings["filename_rule"] == "source_date":
+            date = (payload["created"] or datetime.datetime.now().strftime("%Y-%m-%d"))[:10].replace("-", "")
+            title = f"{title}-{date}"
+        default = f"{title}.{fmt}"
+        result = self.window.create_file_dialog(
+            webview.SAVE_DIALOG, save_filename=default,
+            directory=settings["export_directory"])
+        if not result:
+            return None
+        output = result if isinstance(result, str) else result[0]
+        if os.path.splitext(output)[1].lower() != f".{fmt}":
+            output += f".{fmt}"
+        if fmt == "docx": write_ai_docx_export(output, payload)
+        elif fmt == "pdf": write_ai_pdf_export(output, payload)
+        else: write_txt_export(output, payload)
+        record_export_path(iid, "summary", output)
+        return output
 
     def export_txt(self, iid):
         return self.export_document(iid, "txt")
-
 
 def _preload_model():
     # 启动即后台加载模型（约 30-40 秒），首次转写不用再等
@@ -1776,8 +2763,16 @@ def _set_dock_icon():
         def apply():
             img = AppKit.NSImage.alloc().initWithContentsOfFile_(path)
             if img:
-                AppKit.NSApplication.sharedApplication().setApplicationIconImage_(img)
-                print("[dock] Dock 图标已设置", flush=True)
+                application = AppKit.NSApplication.sharedApplication()
+                application.setApplicationIconImage_(img)
+                # Dock 图标和最小化窗口缩略图是两套状态。只设置前者时，
+                # macOS 仍可能从 Python 解释器取回火箭图标。
+                for native_window in application.windows():
+                    if hasattr(native_window, "setMiniwindowImage_"):
+                        native_window.setMiniwindowImage_(img)
+                    if hasattr(native_window, "setMiniwindowTitle_"):
+                        native_window.setMiniwindowTitle_("WordGrab")
+                print("[dock] Dock 与最小化窗口图标已设置", flush=True)
             else:
                 print("[dock] icns 加载失败", flush=True)
 
@@ -1809,6 +2804,15 @@ def _integrate_native_titlebar(window):
         native.setTitlebarAppearsTransparent_(True)
         native.setTitleVisibility_(getattr(AppKit, "NSWindowTitleHidden", 1))
         native.setMovableByWindowBackground_(True)
+
+        icon_path = next((p for p in (os.path.join(HERE, "assets", "icon.icns"),
+                                      os.path.join(HERE, "icon.icns"))
+                          if os.path.exists(p)), None)
+        if icon_path:
+            mini_icon = AppKit.NSImage.alloc().initWithContentsOfFile_(icon_path)
+            if mini_icon and hasattr(native, "setMiniwindowImage_"):
+                native.setMiniwindowImage_(mini_icon)
+                native.setMiniwindowTitle_("WordGrab")
 
         # macOS 11+ 可去掉标题栏与内容之间的系统分隔线。
         if hasattr(native, "setTitlebarSeparatorStyle_"):
