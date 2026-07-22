@@ -23,6 +23,14 @@
   <a href="https://github.com/lawmanyukk-boop/WordGrab/issues"><strong>反馈问题</strong></a>
 </p>
 
+<p align="center">
+  <img src="assets/screenshots/ui-main.png" alt="WordGrab 主界面 — 转写文稿与说话人分离" width="90%"/>
+</p>
+
+<p align="center">
+  <sub>主界面：左侧历史记录，中间转写文稿与音频联动，右侧自动识别的说话人与音频信息</sub>
+</p>
+
 ---
 
 ## 为什么选择 WordGrab？
@@ -61,12 +69,29 @@
 - **音频文字联动** - 点击文稿跳转播放，音频文字完美同步，方便校对
 - **说话人改名** - 识别出说话人后，可自定义名称（如"张经理"、"客户A"）
 - **多格式导出** - 一键导出 Word、PDF、TXT，直接用于工作汇报或存档
+- **多款主题配色** - 内置 11 款渐变主题，一键切换侧边栏与界面强调色
+
+<p align="center">
+  <img src="assets/screenshots/themes.png" alt="WordGrab 主题配色 — 11 款内置渐变主题" width="80%"/>
+</p>
+
+<p align="center">
+  <sub>内置 11 款主题：极光海、日光珊瑚、薰衣草雾、午夜棱镜、深海蓝、石墨银等，选择后自动保存</sub>
+</p>
 
 ### 🤖 AI 智能总结（可选）
 - **智能内容识别** - 自动识别会议、访谈、讲座、通话、备忘类型，调整分析重点
 - **专业摘要生成** - 提取关键信息、待办事项、决策要点，生成结构化总结
 - **隐私保护设计** - 你的 API Key 只存本机，AI 只看文字不碰原始音频
 - **灵活接口支持** - 支持任何 OpenAI 兼容接口（OpenAI、Claude、本地模型等）
+
+<p align="center">
+  <img src="assets/screenshots/ai-report.png" alt="WordGrab AI 内容分析报告示例" width="60%"/>
+</p>
+
+<p align="center">
+  <sub>AI 内容分析报告：自动生成核心结论、分析摘要与内容脉络，可导出为 PDF</sub>
+</p>
 
 ### 💾 本地数据管理
 - **SQLite 索引** - 历史记录使用本地数据库管理，搜索快速
@@ -240,6 +265,12 @@ pyinstaller WordGrab.spec
 [00:44] 王总监：在此之前，我想先补充一下市场反馈的数据。
 [01:15] 张经理：没问题，那我们先听王总监的市场分析。
 ```
+
+导出为 PDF 后，文稿会带上录制时间、时长、字数、参会人等信息，并按说话人分色排版：
+
+<p align="center">
+  <img src="assets/screenshots/export-pdf.png" alt="WordGrab 导出的 PDF 文稿示例" width="55%"/>
+</p>
 
 ---
 
