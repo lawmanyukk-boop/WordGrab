@@ -436,12 +436,11 @@
       <p class="onboarding-lede">下载一次，之后所有录音都可以在本地完成转写。</p>
       <div class="onboarding-model-card">
         <div class="model-card-icon">✦</div>
-        <div><strong>中文语音模型</strong><small>语音转写、标点和说话人识别</small></div>
+        <div><strong>完整中文语音能力</strong><small>转写、实时字幕、标点、语音检测和说话人区分</small></div>
         <b>约 3 GB</b>
       </div>
-      <p class="onboarding-note">下载时间取决于网络速度。下载完成后，WordGrab 不需要联网也能转写。</p>
+      <p class="onboarding-note">这是使用转写功能的必需文件。支持断点续传；下载完成并校验后，WordGrab 不需要联网也能转写。</p>
       <button id="onboardingDownload" class="onboarding-primary" type="button">下载语音模型 <span>↓</span></button>
-      <button id="onboardingSkip" class="onboarding-secondary" type="button">稍后在设置中下载</button>
     </div>
 
     <div class="onboarding-page" data-onboarding-step="download">
@@ -454,7 +453,7 @@
         <div class="download-card-meta"><span id="onboardingDownloadMeta">正在准备…</span><span id="onboardingDownloadEta"></span></div>
       </div>
       <p id="onboardingDownloadError" class="onboarding-error hidden"></p>
-      <button id="onboardingRetry" class="onboarding-primary hidden" type="button">重新下载</button>
+      <button id="onboardingRetry" class="onboarding-primary hidden" type="button">继续下载</button>
       <p class="onboarding-note">请保持 WordGrab 打开。模型准备好后，你就可以随时离线转写。</p>
     </div>
 
@@ -526,6 +525,6 @@
 
 <audio id="audio"></audio>
 <div id="toast" class="toast"><span id="toastText"></span><button id="toastAction" type="button" class="hidden">撤销</button></div>
-  <script src="/static/app.js?v=20260729-onboarding"></script>
+  <script src="/static/app.js?v=20260729-model-audit"></script>
 </body>
 </html>

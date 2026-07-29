@@ -1,8 +1,12 @@
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import app
 import engine
 import exporters
+import model_catalog
 import store
 
 
@@ -57,6 +61,59 @@ class ApplicationStartupTests(unittest.TestCase):
             app.audio_path_of = original_audio_path_of
         self.assertFalse(result["ok"])
         self.assertIn("不完整", result["message"])
+
+    def test_live_prepare_never_downloads_before_models_are_ready(self):
+        original = model_catalog.all_models_ready
+        try:
+            model_catalog.all_models_ready = lambda: False
+            result = app.Api().prepare_live_transcription()
+        finally:
+            model_catalog.all_models_ready = original
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["code"], "MODEL_NOT_READY")
+
+
+class PackagedRuntimeTests(unittest.TestCase):
+    def test_required_funasr_registry_components_exist(self):
+        result = engine.verify_runtime_components()
+        self.assertEqual(result["funasr"], "1.1.14")
+        self.assertIn("SeacoParaformer", result["components"]["model_classes"])
+
+    def test_model_validation_requires_revision_and_exact_file_sizes(self):
+        spec = model_catalog.ModelSpec(
+            key="test",
+            label="测试模型",
+            model_id="iic/test-model",
+            revision="v1",
+            expected_bytes=7,
+            required_files=(("model.bin", 4),),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / ".mv").write_text("Revision:v1", encoding="utf-8")
+            (path / "model.bin").write_bytes(b"1234")
+            ready, problems = model_catalog.validate_model_directory(path, spec)
+            self.assertTrue(ready, problems)
+            (path / "model.bin").write_bytes(b"bad")
+            ready, problems = model_catalog.validate_model_directory(path, spec)
+            self.assertFalse(ready)
+            self.assertIn("model.bin 大小异常", problems)
+
+    def test_download_progress_includes_modelscope_temporary_chunks(self):
+        spec = model_catalog.MODEL_SPECS[0]
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                "os.environ",
+                {
+                    "MODELSCOPE_CACHE": directory,
+                    "WORDGRAB_DISABLE_LEGACY_MODEL_CACHE": "1",
+                },
+            ):
+                candidates = model_catalog._candidate_directories(spec)
+        self.assertTrue(
+            any("._____temp" in path.parts for path in candidates),
+            candidates,
+        )
 
 
 if __name__ == "__main__":

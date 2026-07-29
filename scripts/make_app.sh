@@ -47,9 +47,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.3.1</string>
+    <string>1.3.2</string>
     <key>CFBundleVersion</key>
-    <string>1.3.1</string>
+    <string>1.3.2</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
@@ -90,6 +90,7 @@ cp \
   "$PROJECT_ROOT/ai_service.py" \
   "$PROJECT_ROOT/engine.py" \
   "$PROJECT_ROOT/exporters.py" \
+  "$PROJECT_ROOT/model_catalog.py" \
   "$PROJECT_ROOT/model_downloader.py" \
   "$PROJECT_ROOT/paths.py" \
   "$PROJECT_ROOT/store.py" \

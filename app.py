@@ -5,6 +5,7 @@
 """
 import os, sys, json, time, uuid, shutil, threading, datetime, re, subprocess, hashlib, sqlite3, queue
 import ai_service
+import model_catalog
 import paths
 import store
 from store import (
@@ -36,8 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI = os.path.join(HERE, "ui")
-APP_SUPPORT = (os.path.expanduser("~/Library/Application Support/WordGrab")
-               if sys.platform == "darwin" else HERE)
+APP_SUPPORT = str(model_catalog.app_data_directory())
 DEFAULT_DATA = os.path.join(APP_SUPPORT, "data")
 STORAGE_CONFIG = os.path.join(APP_SUPPORT, "storage.json")
 
@@ -67,7 +67,7 @@ TRASH = os.path.join(DATA, ".trash")
 INDEX_DB = os.path.join(DATA, "index.db")
 paths.configure_data_directory(DATA)
 store.configure_data_directory(DATA)
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 THEME_KEYS = {
     "aurora-sea", "solar-bloom", "lavender-haze", "tide-ember",
@@ -108,8 +108,6 @@ SETTING_ENUMS = {
     "appearance": {"system", "light", "dark"},
 }
 
-MODEL_CACHE_MARKERS = ("paraformer", "fsmn_vad", "punc_ct", "campplus")
-
 AUDIO_EXT = {".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav",
              ".aac": "audio/aac", ".mp4": "video/mp4", ".mov": "video/quicktime",
              ".m4v": "video/mp4", ".flac": "audio/flac", ".ogg": "audio/ogg"}
@@ -131,7 +129,10 @@ FINALIZE_QUEUE = []                   # 录音最终处理严格按结束顺序�
 FINALIZE_IDLE_SECONDS = 12.0           # 连续录音保留流式模型，空闲后才做最终处理
 LAST_LIVE_ENDED_AT = 0.0
 DELETED = set()                    # 转写期间被用户删除的 iid，两阶段落盘前都要检查
-MODEL_DOWNLOAD = {"status": "idle", "progress": 0, "stage": "", "info": {}, "error": ""}
+MODEL_DOWNLOAD = {
+    "status": "idle", "progress": 0, "stage": "",
+    "info": {}, "error": "", "error_code": "",
+}
 MODEL_DOWNLOAD_LOCK = threading.RLock()
 MODEL_DOWNLOAD_THREAD = None
 _DRAG_STRIP_CLASS = None           # macOS 原生透明拖动带（延迟创建，避免非 macOS 导入 AppKit）
@@ -411,24 +412,6 @@ def migrate_data_directory(directory):
         "moved": True,
         "message": warning or "文稿和录音已移动到新位置",
     }
-
-
-def model_cache_dirs():
-    roots = [
-        # ModelScope snapshot_download(cache_dir=~/.cache/modelscope) 的目录结构。
-        os.path.expanduser("~/.cache/modelscope/iic"),
-        os.path.expanduser("~/.cache/modelscope/models/iic"),
-        os.path.expanduser("~/.cache/modelscope/hub/models/iic"),
-    ]
-    found = []
-    for root in roots:
-        if not os.path.isdir(root):
-            continue
-        for name in os.listdir(root):
-            full = os.path.join(root, name)
-            if os.path.isdir(full) and any(marker in name.lower() for marker in MODEL_CACHE_MARKERS):
-                found.append(full)
-    return found
 
 
 def safe_filename(name):
@@ -2039,27 +2022,43 @@ class Api:
             return self.get_model_download_status()
 
         with MODEL_DOWNLOAD_LOCK:
-            MODEL_DOWNLOAD.update(status="downloading", progress=0, stage="正在准备下载…", info={}, error="")
+            MODEL_DOWNLOAD.update(
+                status="downloading", progress=0, stage="正在检查安装包…",
+                info={}, error="", error_code="",
+            )
 
         def update_progress(stage, progress, details=None):
             with MODEL_DOWNLOAD_LOCK:
                 MODEL_DOWNLOAD.update(
                     status="downloading", stage=stage,
                     progress=(float(progress) if progress is not None else None),
-                    info=dict(details or {}), error="",
+                    info=dict(details or {}), error="", error_code="",
                 )
 
         def download():
             try:
                 from model_downloader import download_models_with_progress
-                # get_model 成功返回才会走到这里；它比检查缓存目录可靠。
                 download_models_with_progress(update_progress)
                 with MODEL_DOWNLOAD_LOCK:
-                    MODEL_DOWNLOAD.update(status="completed", progress=1, stage="语音模型已准备好", error="")
+                    MODEL_DOWNLOAD.update(
+                        status="completed", progress=1, stage="语音模型已准备好",
+                        error="", error_code="",
+                    )
             except Exception as exc:
-                print(f"[model-download] failed: {exc!r}", flush=True)
+                import traceback
+                from model_downloader import friendly_download_error
+                traceback.print_exc()
+                message = friendly_download_error(exc)
+                error_code = (
+                    "RUNTIME_INCOMPLETE"
+                    if "安装包" in message
+                    else "MODEL_DOWNLOAD_FAILED"
+                )
                 with MODEL_DOWNLOAD_LOCK:
-                    MODEL_DOWNLOAD.update(status="error", stage="下载未完成", error=str(exc))
+                    MODEL_DOWNLOAD.update(
+                        status="error", stage="模型准备未完成",
+                        error=message, error_code=error_code,
+                    )
 
         MODEL_DOWNLOAD_THREAD = threading.Thread(target=download, name="wordgrab-model-download", daemon=True)
         MODEL_DOWNLOAD_THREAD.start()
@@ -2070,6 +2069,12 @@ class Api:
         """录音前加载并预热流式模型，避免首句话承担冷启动开销。"""
         global _LIVE_PREPARE_THREAD
         import engine
+        if not model_catalog.all_models_ready():
+            return {
+                "ok": False,
+                "code": "MODEL_NOT_READY",
+                "message": "语音模型尚未准备完整，请先完成首次下载。",
+            }
         with LIVE_RECORDINGS_LOCK:
             if any(state.get("status") in {"starting", "recording", "paused", "stopping"}
                    for state in LIVE_RECORDINGS.values()):
@@ -2915,14 +2920,16 @@ class Api:
         except Exception:
             ffmpeg_path = "未找到"
             ffmpeg_ok = False
-        caches = model_cache_dirs()
+        statuses = model_catalog.model_statuses()
         return {
             "version": APP_VERSION,
             "data_path": DATA,
             "data_size": path_size(DATA),
-            "model_path": os.path.expanduser("~/.cache/modelscope"),
-            "model_size": sum(path_size(path) for path in caches),
-            "model_ready": len(caches) >= len(MODEL_CACHE_MARKERS),
+            "model_path": str(model_catalog.model_cache_root()),
+            "model_size": model_catalog.installed_model_size(),
+            "model_ready": all(item["status"] == "ready" for item in statuses),
+            "model_statuses": statuses,
+            "model_expected_size": model_catalog.EXPECTED_TOTAL_BYTES,
             "ffmpeg_ok": ffmpeg_ok,
             "ffmpeg_path": ffmpeg_path,
         }
@@ -2930,7 +2937,7 @@ class Api:
     def open_local_resource(self, resource):
         allowed = {
             "data": DATA,
-            "models": os.path.expanduser("~/.cache/modelscope"),
+            "models": str(model_catalog.model_cache_root()),
             "readme": os.path.join(HERE, "README.md"),
             "license": os.path.join(HERE, "LICENSE"),
         }
@@ -3380,11 +3387,11 @@ class Api:
     def clear_model_cache(self):
         if TRANSCRIBE_LOCK.locked():
             return {"ok": False, "message": "仍有音频正在转写，请完成后再清理模型。"}
-        caches = model_cache_dirs()
-        freed = sum(path_size(path) for path in caches)
-        for path in caches:
-            shutil.rmtree(path, ignore_errors=True)
-        return {"ok": True, "freed": freed}
+        import engine
+        engine.release_models()
+        freed, removed = model_catalog.remove_wordgrab_models()
+        apply_settings_patch({"onboarding_completed": False})
+        return {"ok": True, "freed": freed, "removed": list(removed)}
 
     # 导出 Word / PDF / TXT（弹原生保存对话框选位置）
     def export_document(self, iid, export_format=None):
@@ -3717,23 +3724,60 @@ def _install_native_drag_strip(window):
 
 
 def verify_packaged_runtime():
-    """发布包自检：验证惰性加载的语音依赖和包内资源是否完整。"""
+    """发布包快速自检：同时验证依赖版本和 FunASR 动态注册表。"""
+    import engine
     import funasr
     import modelscope
     import sklearn
     import torch
 
-    print(json.dumps({
+    component_result = engine.verify_runtime_components()
+    result = {
         "ok": True,
         "funasr": funasr.__version__,
         "modelscope": modelscope.__version__,
         "sklearn": sklearn.__version__,
         "torch": torch.__version__,
-    }, ensure_ascii=False), flush=True)
+        "components": component_result["components"],
+    }
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return result
+
+
+def verify_packaged_models():
+    """发布前慢速验收：下载固定模型并真实构造最终与实时识别管线。"""
+    import engine
+    from model_downloader import download_models_with_progress
+
+    runtime = verify_packaged_runtime()
+
+    def report(stage, progress, info):
+        print(json.dumps({
+            "stage": stage,
+            "progress": progress,
+            "info": info,
+        }, ensure_ascii=False), flush=True)
+
+    statuses = download_models_with_progress(report)
+    engine.get_model()
+    engine.release_models()
+    streaming_profile = engine.prepare_streaming_model()
+    engine.release_models()
+    result = {
+        "ok": True,
+        "runtime": runtime,
+        "models": statuses,
+        "streaming_profile": streaming_profile,
+    }
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+    return result
 
 
 def main():
     global API_REF
+    if "--verify-models" in sys.argv:
+        verify_packaged_models()
+        return
     if "--verify-runtime" in sys.argv:
         verify_packaged_runtime()
         return

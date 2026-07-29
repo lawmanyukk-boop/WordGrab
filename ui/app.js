@@ -1645,12 +1645,17 @@ function setOnboardingVisible(show){
 async function completeOnboarding(){
   await saveSetting('onboarding_completed',true);
   setOnboardingVisible(false);
+  if(API.prepare_live_transcription){
+    Promise.resolve(API.prepare_live_transcription()).catch(()=>{});
+  }
 }
 function formatDownloadMeta(info={}){
   const downloaded=Number(info.downloaded_mb)||0,total=Number(info.total_mb)||0,speed=Number(info.speed_mb_s)||0;
+  const model=info.current_model?`${info.current_model}${info.current_index?`（${info.current_index}/${info.total_models||5}）`:''}`:'';
   if(total>0){
     const progress=`${downloaded.toFixed(downloaded<10?1:0)} MB / ${total.toFixed(0)} MB`;
-    return speed>.1?`${progress} · ${speed.toFixed(1)} MB/s`:progress;
+    const transfer=speed>.1?`${progress} · ${speed.toFixed(1)} MB/s`:progress;
+    return model?`${model} · ${transfer}`:transfer;
   }
   if(downloaded>0) return speed>.1?`本次已下载 ${downloaded.toFixed(0)} MB · ${speed.toFixed(1)} MB/s`:`本次已下载 ${downloaded.toFixed(0)} MB`;
   return info.current_model?`正在准备：${info.current_model}`:'正在准备下载…';
@@ -1660,10 +1665,12 @@ function updateOnboardingDownload(state={}){
   const progress=hasProgress?Math.max(0,Math.min(1,Number(state.progress))):0;
   $('#onboardingDownloadFill').style.width=hasProgress?`${Math.round(progress*100)}%`:'32%';
   $('#onboardingDownloadFill').classList.toggle('is-indeterminate',!hasProgress);
-  $('#onboardingDownloadPercent').textContent=hasProgress?`${Math.round(progress*100)}%`:'下载中';
+  const percent=state.status==='completed'?100:Math.floor(progress*100);
+  $('#onboardingDownloadPercent').textContent=hasProgress?`${percent}%`:'下载中';
   $('#onboardingDownloadStage').textContent=state.stage||'正在下载语音模型…';
   $('#onboardingDownloadMeta').textContent=formatDownloadMeta(state.info);
-  $('#onboardingDownloadEta').textContent='';
+  const eta=Number(state.info?.eta_seconds);
+  $('#onboardingDownloadEta').textContent=Number.isFinite(eta)&&eta>0?`约 ${fmt(eta)} 后完成`:'';
   const failed=state.status==='error';
   $('#onboardingDownloadError').textContent=failed?(state.error||'下载没有完成，请检查网络后重试。'):'';
   $('#onboardingDownloadError').classList.toggle('hidden',!failed);
@@ -1684,13 +1691,14 @@ async function beginModelDownload(){
   },850);
 }
 async function initOnboarding(){
-  if(!API.get_system_info) return;
+  if(!API.get_system_info) return null;
   try{
-    await API.get_system_info();
-    if(appSettings.onboarding_completed) return;
+    const systemInfo=await API.get_system_info();
+    if(appSettings.onboarding_completed&&systemInfo.model_ready) return systemInfo;
     setOnboardingVisible(true);
-    showOnboardingPage('welcome');
-  }catch(_){ }
+    showOnboardingPage(appSettings.onboarding_completed?'overview':'welcome');
+    return systemInfo;
+  }catch(_){ return null; }
 }
 
 /* ---------- 启动 ---------- */
@@ -1700,15 +1708,14 @@ async function boot(api,initialId){
   $('#onboardingWelcomeNext').onclick=()=>showOnboardingPage('overview');
   $('#onboardingDownload').onclick=beginModelDownload;
   $('#onboardingRetry').onclick=beginModelDownload;
-  $('#onboardingSkip').onclick=completeOnboarding;
   $('#onboardingFinish').onclick=completeOnboarding;
   $('#onboardingImport').onclick=async()=>{await completeOnboarding();await doImport();};
-  await initOnboarding();
+  const systemInfo=await initOnboarding();
   initDrop();
   await loadHistory();
   // 不阻塞界面地提前加载实时模型。用户稍后点击“录音”时，麦克风仍然
   // 立即开始保存，而字幕通常已经完成冷启动，不再落后二十多秒。
-  if(API.prepare_live_transcription){
+  if(appSettings.onboarding_completed&&systemInfo?.model_ready&&API.prepare_live_transcription){
     Promise.resolve(API.prepare_live_transcription()).catch(()=>{});
   }
   const startupId=initialId||(appSettings.reopen_last&&appSettings.last_item_id);

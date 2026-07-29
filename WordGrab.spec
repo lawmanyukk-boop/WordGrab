@@ -5,7 +5,24 @@ import sys
 from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
-funasr_datas = collect_data_files('funasr', includes=['version.txt'])
+# FunASR 的注册器和 TorchScript 装饰器都会在运行时读取源码。冻结包必须
+# 同时携带 .py 文件，否则组件虽然在 PYZ 中，注册和 CIF 初始化仍会失败。
+funasr_datas = collect_data_files('funasr', include_py_files=True)
+funasr_hiddenimports = [
+    'funasr.models.seaco_paraformer.model',
+    'funasr.models.paraformer_streaming.model',
+    'funasr.models.fsmn_vad_streaming.model',
+    'funasr.models.ct_transformer.model',
+    'funasr.models.campplus.model',
+    'funasr.frontends.wav_frontend',
+    'funasr.tokenizer.char_tokenizer',
+    'funasr.models.sanm.encoder',
+    'funasr.models.scama.encoder',
+    'funasr.models.ct_transformer_streaming.encoder',
+    'funasr.models.paraformer.decoder',
+    'funasr.models.paraformer.cif_predictor',
+    'funasr.models.bicif_paraformer.cif_predictor',
+]
 modelscope_datas = collect_data_files(
     'modelscope', includes=['utils/ast_index_file.py'], include_py_files=True
 )
@@ -20,8 +37,7 @@ a = Analysis(
         ('README.md', '.'),
         ('LICENSE', '.'),
     ] + funasr_datas + modelscope_datas,
-    hiddenimports=[
-        'funasr',
+    hiddenimports=funasr_hiddenimports + [
         'modelscope',
         'modelscope.version',
         'torch',
@@ -84,7 +100,7 @@ if sys.platform == 'darwin':
         icon='assets/icon.icns',
         bundle_identifier='com.local.wordgrab',
         info_plist={
-            'CFBundleShortVersionString': '1.3.1',
-            'CFBundleVersion': '1.3.1',
+            'CFBundleShortVersionString': '1.3.2',
+            'CFBundleVersion': '1.3.2',
         },
     )

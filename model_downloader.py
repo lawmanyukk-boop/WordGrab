@@ -1,109 +1,182 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""模型下载进度追踪器。"""
+"""固定模型清单的下载、进度和完整性校验。"""
 import os
-import sys
+import shutil
 import threading
 import time
-from pathlib import Path
+
+import model_catalog
 
 
 class ModelDownloadMonitor:
-    """监控 ModelScope 模型缓存目录，追踪下载进度"""
+    """只统计 WordGrab 的五个模型，重复缓存不会让进度超过 100%。"""
 
     def __init__(self, progress_callback=None):
         self.progress_callback = progress_callback
-        self.cache_dir = Path(os.environ.get(
-            "MODELSCOPE_CACHE",
-            os.path.expanduser("~/.cache/modelscope")
-        ))
         self.monitoring = False
         self.monitor_thread = None
-        self.initial_size_mb = 0
+        self.current_model = ""
+        self.current_index = 0
+        self.total_models = len(model_catalog.MODEL_SPECS)
+        self._state_lock = threading.RLock()
 
-    def get_cache_size(self):
-        """获取当前缓存目录大小（MB）"""
-        total = 0
-        if not self.cache_dir.exists():
-            return 0
+    def set_current_model(self, spec, index):
+        with self._state_lock:
+            self.current_model = spec.label
+            self.current_index = index
 
-        for root, dirs, files in os.walk(self.cache_dir):
-            for file in files:
-                try:
-                    filepath = os.path.join(root, file)
-                    total += os.path.getsize(filepath)
-                except (OSError, FileNotFoundError):
-                    continue
+    def snapshot(self, speed_bytes_s=0):
+        downloaded, total = model_catalog.download_progress()
+        progress = min(0.995, downloaded / total) if total else 0
+        with self._state_lock:
+            current_model = self.current_model
+            current_index = self.current_index
+        eta_seconds = None
+        if speed_bytes_s > 0 and downloaded < total:
+            eta_seconds = max(0, int((total - downloaded) / speed_bytes_s))
+        return progress, {
+            "downloaded_mb": round(downloaded / (1024 * 1024), 1),
+            "total_mb": round(total / (1024 * 1024), 1),
+            "speed_mb_s": round(speed_bytes_s / (1024 * 1024), 2),
+            "eta_seconds": eta_seconds,
+            "current_model": current_model,
+            "current_index": current_index,
+            "total_models": self.total_models,
+        }
 
-        return total / (1024 * 1024)  # 转换为 MB
+    def emit(self, stage=None, speed_bytes_s=0):
+        if not self.progress_callback:
+            return
+        progress, details = self.snapshot(speed_bytes_s)
+        if stage is None:
+            current = details.get("current_model")
+            stage = f"正在准备：{current}" if current else "正在准备语音模型…"
+        self.progress_callback(stage, progress, details)
 
     def start_monitoring(self):
-        """开始监控下载进度"""
         if self.monitoring:
             return
-
-        # ModelScope 不会稳定提供总字节数。以本次下载开始前的缓存大小为
-        # 基线，只报告本次新增的数据量，避免伪造一个错误的总大小。
-        self.initial_size_mb = self.get_cache_size()
         self.monitoring = True
         self.monitor_thread = threading.Thread(
             target=self._monitor_loop,
-            daemon=True
+            name="wordgrab-model-progress",
+            daemon=True,
         )
         self.monitor_thread.start()
 
     def stop_monitoring(self):
-        """停止监控"""
         self.monitoring = False
         if self.monitor_thread:
             self.monitor_thread.join(timeout=2)
 
     def _monitor_loop(self):
-        """监控循环"""
-        last_size = self.get_cache_size()
-
+        previous_bytes, _ = model_catalog.download_progress()
+        previous_time = time.monotonic()
         while self.monitoring:
-            time.sleep(2)  # 每2秒检查一次
+            time.sleep(1)
+            if not self.monitoring:
+                break
+            current_bytes, _ = model_catalog.download_progress()
+            current_time = time.monotonic()
+            elapsed = max(0.001, current_time - previous_time)
+            speed = max(0, current_bytes - previous_bytes) / elapsed
+            self.emit(speed_bytes_s=speed)
+            previous_bytes = current_bytes
+            previous_time = current_time
 
-            current_size = self.get_cache_size()
-            downloaded_mb = max(0, current_size - self.initial_size_mb)
-            speed_mb_s = max(0, (current_size - last_size) / 2)  # 2秒间隔
-            if self.progress_callback:
-                self.progress_callback("正在下载语音模型…", None, {
-                    "downloaded_mb": round(downloaded_mb, 1),
-                    "speed_mb_s": round(speed_mb_s, 2),
-                })
 
-            last_size = current_size
+def _ensure_disk_space():
+    cache_root = model_catalog.model_cache_root()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    downloaded, total = model_catalog.download_progress()
+    remaining = max(0, total - downloaded)
+    reserve = 512 * 1024 * 1024
+    free = shutil.disk_usage(cache_root).free
+    if free < remaining + reserve:
+        needed_gb = (remaining + reserve) / (1024 ** 3)
+        free_gb = free / (1024 ** 3)
+        raise RuntimeError(
+            f"磁盘空间不足：还需要约 {needed_gb:.1f} GB，当前可用 {free_gb:.1f} GB。"
+        )
+
+
+def friendly_download_error(exc):
+    message = str(exc).strip()
+    lowered = message.lower()
+    if "安装包缺少语音组件" in message or "nonetype" in lowered:
+        return "当前安装包的语音组件不完整，请安装更新版本后重试。"
+    if "no space left" in lowered or "磁盘空间不足" in message:
+        return message or "磁盘空间不足，请清理空间后重试。"
+    if any(token in lowered for token in (
+        "timed out", "timeout", "connection", "network",
+        "name or service not known", "nodename nor servname",
+        "ssl", "proxy", "http",
+    )):
+        return "网络连接中断。已下载的部分会保留，请检查网络后点击“继续下载”。"
+    return f"模型准备失败（{type(exc).__name__}）：{message or '未知错误'}"
+
 
 def download_models_with_progress(progress_callback=None):
-    """下载模型并显示进度
+    """按固定版本逐个下载五个必需模型，并在返回前校验完整性。"""
+    import engine
+    from modelscope.hub.snapshot_download import snapshot_download
 
-    Args:
-        progress_callback: 回调函数 callback(message, progress, info)
-    """
-    # 使用引擎的运行时别名加载，避免下载器和引擎分别下载不同的模型集。
-    from engine import get_model
-    get_model(progress_callback)
+    # 先检查安装包自身，避免用户下载近 3 GB 后才发现运行组件缺失。
+    engine.verify_runtime_components()
+    _ensure_disk_space()
+
+    monitor = ModelDownloadMonitor(progress_callback)
+    monitor.start_monitoring()
+    monitor_stopped = False
+    try:
+        for index, spec in enumerate(model_catalog.MODEL_SPECS, start=1):
+            monitor.set_current_model(spec, index)
+            ready_path = model_catalog.ready_model_directory(spec)
+            if ready_path is not None:
+                monitor.emit(f"已校验：{spec.label}")
+                continue
+
+            monitor.emit(f"正在下载 {index}/{len(model_catalog.MODEL_SPECS)}：{spec.label}")
+            downloaded_path = snapshot_download(
+                spec.model_id,
+                revision=spec.revision,
+                cache_dir=str(model_catalog.model_cache_root()),
+            )
+            ready, problems = model_catalog.validate_model_directory(downloaded_path, spec)
+            if not ready:
+                raise RuntimeError(
+                    f"{spec.label}文件不完整：{'、'.join(problems) or '校验失败'}"
+                )
+
+        statuses = model_catalog.model_statuses()
+        incomplete = [
+            f"{status['label']}（{'; '.join(status['problems']) or status['status']}）"
+            for status in statuses
+            if status["status"] != "ready"
+        ]
+        if incomplete:
+            raise RuntimeError("模型文件未完整下载：" + "、".join(incomplete))
+        # 先停止后台采样，再发出 100%，避免结束瞬间被旧的 99.5% 进度覆盖。
+        monitor.stop_monitoring()
+        monitor_stopped = True
+        if progress_callback:
+            _, details = monitor.snapshot()
+            details.update(downloaded_mb=round(model_catalog.EXPECTED_TOTAL_BYTES / (1024 * 1024), 1))
+            progress_callback("五个语音模型均已校验", 1.0, details)
+        return statuses
+    finally:
+        if not monitor_stopped:
+            monitor.stop_monitoring()
 
 
 if __name__ == "__main__":
-    """命令行测试"""
     def print_progress(message, progress, info):
-        if progress is not None:
-            bar_length = 40
-            filled = int(bar_length * progress)
-            bar = "█" * filled + "░" * (bar_length - filled)
-            print(f"\r{message} [{bar}] {int(progress * 100)}%", end="", flush=True)
-            if info:
-                speed = info.get("speed_mb_s", 0)
-                if speed > 0:
-                    print(f" | {speed:.1f} MB/s | {info.get('eta', '')}", end="", flush=True)
-        else:
-            print(f"\n{message}", flush=True)
-
+        percent = int((progress or 0) * 100)
+        current = info.get("current_model") if info else ""
+        print(f"\r{percent:3d}% {message} {current or ''}".rstrip(), end="", flush=True)
         if progress == 1.0:
-            print()  # 完成后换行
+            print()
 
     print("开始下载 WordGrab 所需模型...")
     download_models_with_progress(print_progress)

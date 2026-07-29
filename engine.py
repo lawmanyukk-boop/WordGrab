@@ -8,7 +8,10 @@ FunASR paraformer-zh + fsmn-vad + ct-punc + cam++ 声纹分离
 - transcribe_draft：VAD 切段 → 按块 ASR+标点 → 逐块回调，快出无说话人初稿
 - transcribe_full：完整管线（含 cam++ 声纹分离），慢但结果完整
 """
-import os, subprocess, tempfile, json, threading, shutil, gc, time
+import importlib
+import os, sys, subprocess, tempfile, json, threading, shutil, gc, time
+
+import model_catalog
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -51,7 +54,7 @@ def _resolve_ffmpeg():
     )
 
 
-os.environ.setdefault("MODELSCOPE_CACHE", os.path.expanduser("~/.cache/modelscope"))
+os.environ.setdefault("MODELSCOPE_CACHE", str(model_catalog.model_cache_root()))
 
 _MODEL = None
 _STREAM_MODEL = None
@@ -71,14 +74,106 @@ LIVE_UTTERANCE_MAX_SECONDS = 4.8
 LIVE_SILENCE_END_SECONDS = 0.65
 
 
-def _cached_model_path(model_id):
-    """缓存完整时直接使用本地路径，避免每次启动都联网解析模型别名。"""
-    candidate = os.path.join(
-        os.path.expanduser("~/.cache/modelscope/models"), *model_id.split("/")
-    )
-    if os.path.isfile(os.path.join(candidate, "configuration.json")):
-        return candidate
-    return model_id
+REQUIRED_FUNASR_COMPONENTS = {
+    "model_classes": {
+        "SeacoParaformer",
+        "ParaformerStreaming",
+        "FsmnVADStreaming",
+        "CTTransformer",
+        "CAMPPlus",
+    },
+    "frontend_classes": {"WavFrontend", "WavFrontendOnline"},
+    "tokenizer_classes": {"CharTokenizer"},
+    "encoder_classes": {"SANMEncoder", "SANMEncoderChunkOpt", "SANMVadEncoder"},
+    "decoder_classes": {"ParaformerSANMDecoder"},
+    "predictor_classes": {"CifPredictorV2", "CifPredictorV3"},
+}
+
+REQUIRED_FUNASR_MODULES = (
+    "funasr.models.seaco_paraformer.model",
+    "funasr.models.paraformer_streaming.model",
+    "funasr.models.fsmn_vad_streaming.model",
+    "funasr.models.ct_transformer.model",
+    "funasr.models.campplus.model",
+    "funasr.frontends.wav_frontend",
+    "funasr.tokenizer.char_tokenizer",
+    "funasr.models.sanm.encoder",
+    "funasr.models.scama.encoder",
+    "funasr.models.ct_transformer_streaming.encoder",
+    "funasr.models.paraformer.decoder",
+    "funasr.models.paraformer.cif_predictor",
+    "funasr.models.bicif_paraformer.cif_predictor",
+)
+
+
+def _enable_frozen_funasr_registration(tables):
+    """冻结包没有 .py 源码；绕开 FunASR 装饰器对源码行号的强制读取。"""
+    if not getattr(sys, "frozen", False) or getattr(tables, "_wordgrab_frozen_safe", False):
+        return
+
+    def frozen_safe_register(register_tables_key, key=None):
+        def decorator(target_class):
+            if not hasattr(tables, register_tables_key):
+                setattr(tables, register_tables_key, {})
+            registry = getattr(tables, register_tables_key)
+            registry_key = key if key is not None else target_class.__name__
+            registry[registry_key] = target_class
+
+            meta_key = register_tables_key + "_meta"
+            if not hasattr(tables, meta_key):
+                setattr(tables, meta_key, {})
+            getattr(tables, meta_key)[registry_key] = [
+                registry_key,
+                target_class.__name__,
+                f"{target_class.__module__}:frozen",
+            ]
+            return target_class
+        return decorator
+
+    tables.register = frozen_safe_register
+    tables._wordgrab_frozen_safe = True
+
+
+def verify_runtime_components():
+    """显式加载并验证 FunASR 注册组件，不依赖冻结环境的目录扫描。"""
+    try:
+        import funasr
+        from funasr.register import tables
+    except Exception as exc:
+        raise RuntimeError(f"安装包无法加载语音运行库：{exc}") from exc
+
+    _enable_frozen_funasr_registration(tables)
+    import_failures = []
+    for module_name in REQUIRED_FUNASR_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:
+            import_failures.append(f"{module_name}（{type(exc).__name__}: {exc}）")
+    if import_failures:
+        raise RuntimeError(
+            "安装包无法加载语音组件，请重新安装 WordGrab。失败项："
+            + "、".join(import_failures)
+        )
+
+    missing = []
+    available = {}
+    for table_name, required_names in REQUIRED_FUNASR_COMPONENTS.items():
+        table = getattr(tables, table_name, {})
+        present = set(table.keys())
+        available[table_name] = sorted(required_names & present)
+        missing.extend(
+            f"{table_name}.{name}"
+            for name in sorted(required_names - present)
+        )
+    if missing:
+        raise RuntimeError(
+            "安装包缺少语音组件，请重新安装 WordGrab。缺失项："
+            + "、".join(missing)
+        )
+    return {
+        "funasr": getattr(funasr, "__version__", "unknown"),
+        "components": available,
+    }
 
 
 def _disable_modelside_pip_install():
@@ -96,65 +191,45 @@ def _disable_modelside_pip_install():
 
 
 def get_model(progress=None):
-    """懒加载单例模型（冷启动约 30-40 秒，app 启动时可后台预加载）
-
-    首次运行会自动下载约 3GB 模型文件，支持进度提示
-    """
+    """从已校验的本地文件懒加载最终转写模型，不在后台隐式联网。"""
     global _MODEL
     if _MODEL is None:
         with _MODEL_LOCK:
             if _MODEL is None:
+                verify_runtime_components()
                 if progress:
-                    # 首次下载，显示下载进度
-                    try:
-                        from model_downloader import ModelDownloadMonitor
-                        monitor = ModelDownloadMonitor(progress)
-                        monitor.start_monitoring()
-                    except ImportError:
-                        monitor = None
-                else:
-                    monitor = None
+                    progress("正在加载模型…", None, {"status": "loading"})
 
-                try:
-                    if progress:
-                        progress("正在加载模型…", None, {"status": "loading"})
+                import torch
+                from funasr import AutoModel
+                _disable_modelside_pip_install()
+                device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-                    import torch
-                    from funasr import AutoModel
-                    _disable_modelside_pip_install()
-                    device = "mps" if torch.backends.mps.is_available() else "cpu"
+                _MODEL = AutoModel(
+                    model=model_catalog.require_model_directory("transcription"),
+                    vad_model=model_catalog.require_model_directory("vad"),
+                    punc_model=model_catalog.require_model_directory("punctuation"),
+                    spk_model=model_catalog.require_model_directory("speakers"),
+                    disable_update=True,
+                    device=device,
+                )
 
-                    _MODEL = AutoModel(
-                        model="paraformer-zh",
-                        vad_model="fsmn-vad",
-                        punc_model="ct-punc",
-                        spk_model="cam++",
-                        disable_update=True,
-                        device=device,
-                    )
-
-                    if progress:
-                        progress("模型加载完成", 1.0, {"status": "ready"})
-
-                finally:
-                    if monitor:
-                        monitor.stop_monitoring()
+                if progress:
+                    progress("模型加载完成", 1.0, {"status": "ready"})
 
     return _MODEL
 
 
 def get_streaming_model(progress=None):
-    """加载实时模型。与最终模型分开，便于录音结束后释放。"""
+    """从已校验的本地文件加载实时模型，不在启动阶段隐式下载。"""
     global _STREAM_MODEL
     if _STREAM_MODEL is None:
         with _STREAM_MODEL_LOCK:
             if _STREAM_MODEL is None:
-                import torch
+                verify_runtime_components()
                 from funasr import AutoModel
                 _STREAM_MODEL = AutoModel(
-                    model=_cached_model_path(
-                        "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
-                    ),
+                    model=model_catalog.require_model_directory("streaming"),
                     disable_update=True,
                     device=STREAMING_DEVICE,
                     ncpu=STREAMING_NCPU,
