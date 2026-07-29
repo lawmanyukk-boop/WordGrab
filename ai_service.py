@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 
 
-KEY_FILE = os.path.expanduser("~/Library/Application Support/录音转文字/data/.ai_api_key")
+KEY_FILE = os.path.expanduser("~/Library/Application Support/WordGrab/data/.ai_api_key")
 CHUNK_CHAR_LIMIT = 12000
 # 中转服务高峰期常瞬时断连/超时；这类错误自动重试而非直接失败。
 _MAX_ATTEMPTS = 3

@@ -14,7 +14,7 @@
     if (params.get('clean') === '1') document.documentElement.classList.add('clean-preview');
   })();
 </script>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20260729-onboarding">
 </head>
 <body>
 <div class="pywebview-drag-region app-drag-region" aria-hidden="true"></div>
@@ -22,10 +22,17 @@
 
   <!-- 侧边栏 -->
   <aside class="sidebar">
-    <button id="importBtn" class="btn-primary" style="margin-bottom: 8px;">
-      <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M11 5a1 1 0 1 1 2 0v6h6a1 1 0 1 1 0 2h-6v6a1 1 0 1 1-2 0v-6H5a1 1 0 1 1 0-2h6V5z"/></svg>
-      导入音频
-    </button>
+    <div class="sidebar-actions">
+      <button id="importBtn" class="btn-primary" type="button">
+        <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M11 5a1 1 0 1 1 2 0v6h6a1 1 0 1 1 0 2h-6v6a1 1 0 1 1-2 0v-6H5a1 1 0 1 1 0-2h6V5z"/></svg>
+        导入
+      </button>
+      <div class="record-controls">
+        <button id="recordBtn" class="btn-primary" type="button">录音</button>
+        <button id="pauseRecordBtn" class="btn-primary hidden" type="button">暂停</button>
+        <button id="stopRecordBtn" class="btn-primary hidden" type="button">结束</button>
+      </div>
+    </div>
 
     <label class="search-wrap" for="sideSearch">
       <span>查找文稿</span>
@@ -51,10 +58,32 @@
   <main class="main">
     <!-- 空态 -->
     <div id="empty" class="empty">
-      <img class="empty-illu" src="/static/icon_1024.png" alt="">
-      <h2>把录音变成文字稿</h2>
-      <p>点击左上角「导入音频」，或把文件拖进窗口<br>中文高精度 · 自动区分说话人 · 全程本地</p>
-      <button id="importBtn2" class="btn-primary lg">导入音频</button>
+      <div class="empty-mark" aria-label="WordGrab">
+        <span class="empty-orbit empty-orbit-primary" aria-hidden="true">
+          <i class="orbit-dot dot-blue"></i>
+          <i class="orbit-dot dot-red"></i>
+          <i class="orbit-dot dot-yellow"></i>
+          <i class="orbit-dot dot-teal"></i>
+          <i class="orbit-dot dot-purple"></i>
+          <i class="orbit-dot dot-pink"></i>
+        </span>
+        <span class="empty-orbit empty-orbit-secondary" aria-hidden="true">
+          <i class="orbit-dot dot-orange"></i>
+          <i class="orbit-dot dot-green"></i>
+          <i class="orbit-dot dot-sky"></i>
+          <i class="orbit-dot dot-violet"></i>
+          <i class="orbit-dot dot-rose"></i>
+        </span>
+        <svg class="empty-mark-title" viewBox="0 0 260 260" aria-hidden="true">
+          <defs>
+            <path id="wordgrab-title-arc" d="M 36 130 A 94 94 0 0 1 224 130"/>
+          </defs>
+          <text>
+            <textPath href="#wordgrab-title-arc" startOffset="50%" text-anchor="middle">WordGrab</textPath>
+          </text>
+        </svg>
+        <img class="empty-turntable" src="/static/empty-logo.png" alt="">
+      </div>
     </div>
 
     <!-- 内容 -->
@@ -128,7 +157,26 @@
             </section>
           </aside>
         </div>
+
+        <div id="liveCaption" class="live-caption hidden" role="status" aria-live="polite" aria-atomic="true">
+          <div class="live-caption-state">
+            <span class="live-caption-pulse" aria-hidden="true"></span>
+            <strong id="liveCaptionLabel">正在听</strong>
+            <time id="liveCaptionTime">00:00</time>
+            <span id="liveCaptionLag">字幕同步</span>
+          </div>
+          <p id="liveCaptionText">开始说话后，当前一句话会显示在这里</p>
+        </div>
       </section>
+
+      <!-- 后台录音状态：查看其他文稿时与播放器组成双层工作栏 -->
+      <button id="backgroundRecordingBar" class="background-recording-bar hidden" type="button" aria-label="返回当前录音">
+        <span class="background-recording-dot" aria-hidden="true"></span>
+        <strong id="backgroundRecordingLabel">正在录音</strong>
+        <time id="backgroundRecordingTime">00:00</time>
+        <span id="backgroundRecordingStage">实时字幕正常</span>
+        <span class="background-recording-return">返回实时录音 →</span>
+      </button>
 
       <!-- 播放器 -->
       <div class="player">
@@ -363,6 +411,64 @@
 
 </div>
 
+<!-- 首次使用引导：在进入工作台前完成本地模型准备 -->
+<section id="onboarding" class="onboarding hidden" aria-labelledby="onboardingTitle">
+  <div class="onboarding-window">
+    <div class="onboarding-brand"><img src="/static/LOGO.svg" alt=""><span>WordGrab</span></div>
+    <div class="onboarding-steps" aria-label="设置进度"><i class="active"></i><i></i><i></i></div>
+
+    <div class="onboarding-page active" data-onboarding-step="welcome">
+      <div class="onboarding-signal" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+      <p class="onboarding-kicker">你的录音，只属于你</p>
+      <h1 id="onboardingTitle">欢迎使用 WordGrab</h1>
+      <p class="onboarding-lede">100% 本地离线语音转写，把隐私留给自己，把繁琐交给 WordGrab。</p>
+      <div class="onboarding-promises">
+        <div><b>⌁</b><span><strong>本地转写</strong><small>录音和文稿始终留在电脑里</small></span></div>
+        <div><b>◎</b><span><strong>自动区分说话人</strong><small>清楚知道每一句是谁说的</small></span></div>
+        <div><b>↓</b><span><strong>一次下载，之后离线使用</strong><small>首次准备语音模型，需要联网</small></span></div>
+      </div>
+      <button id="onboardingWelcomeNext" class="onboarding-primary" type="button">开始准备 <span>→</span></button>
+    </div>
+
+    <div class="onboarding-page" data-onboarding-step="overview">
+      <p class="onboarding-kicker">首次准备</p>
+      <h1>先准备好语音能力</h1>
+      <p class="onboarding-lede">下载一次，之后所有录音都可以在本地完成转写。</p>
+      <div class="onboarding-model-card">
+        <div class="model-card-icon">✦</div>
+        <div><strong>中文语音模型</strong><small>语音转写、标点和说话人识别</small></div>
+        <b>约 2 GB</b>
+      </div>
+      <p class="onboarding-note">下载时间取决于网络速度。下载完成后，WordGrab 不需要联网也能转写。</p>
+      <button id="onboardingDownload" class="onboarding-primary" type="button">下载语音模型 <span>↓</span></button>
+      <button id="onboardingSkip" class="onboarding-secondary" type="button">稍后在设置中下载</button>
+    </div>
+
+    <div class="onboarding-page" data-onboarding-step="download">
+      <p class="onboarding-kicker">正在准备</p>
+      <h1>WordGrab 正在就绪</h1>
+      <p id="onboardingDownloadStage" class="onboarding-lede">正在连接模型服务…</p>
+      <div class="onboarding-download-card">
+        <div class="download-card-head"><span>中文语音模型</span><strong id="onboardingDownloadPercent">0%</strong></div>
+        <div class="onboarding-meter"><i id="onboardingDownloadFill"></i></div>
+        <div class="download-card-meta"><span id="onboardingDownloadMeta">正在准备…</span><span id="onboardingDownloadEta"></span></div>
+      </div>
+      <p id="onboardingDownloadError" class="onboarding-error hidden"></p>
+      <button id="onboardingRetry" class="onboarding-primary hidden" type="button">重新下载</button>
+      <p class="onboarding-note">请保持 WordGrab 打开。模型准备好后，你就可以随时离线转写。</p>
+    </div>
+
+    <div class="onboarding-page" data-onboarding-step="done">
+      <div class="onboarding-ready-mark" aria-hidden="true">✓</div>
+      <p class="onboarding-kicker">全部准备好了</p>
+      <h1>现在，开始记录吧</h1>
+      <p class="onboarding-lede">导入一段录音，或直接开始录音。WordGrab 会在你的电脑上完成全部转写。</p>
+      <button id="onboardingImport" class="onboarding-primary" type="button">导入一段录音 <span>→</span></button>
+      <button id="onboardingFinish" class="onboarding-secondary" type="button">先看看工作台</button>
+    </div>
+  </div>
+</section>
+
 <div id="historyContextMenu" class="context-menu hidden" role="menu" aria-label="文稿操作">
   <button type="button" role="menuitem" data-context-action="rename">重命名</button>
   <div class="context-submenu-host">
@@ -420,6 +526,6 @@
 
 <audio id="audio"></audio>
 <div id="toast" class="toast"><span id="toastText"></span><button id="toastAction" type="button" class="hidden">撤销</button></div>
-<script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260729-onboarding"></script>
 </body>
 </html>

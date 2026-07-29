@@ -17,7 +17,7 @@ const DEFAULT_APP_SETTINGS={
   theme:'aurora-sea',reopen_last:true,auto_open_import:true,default_speed:1,skip_seconds:15,
   auto_diarization:true,transcription_mode:'accuracy',export_format:'txt',export_directory:'',
   filename_rule:'source_date',font_size:'standard',list_density:'standard',appearance:'light',follow_system:false,
-  delete_audio_with_transcript:true,last_item_id:'',ai_base_url:'',ai_model:'',ai_summary_template:'general',ai_privacy_host:''
+  delete_audio_with_transcript:true,last_item_id:'',ai_base_url:'',ai_model:'',ai_summary_template:'general',ai_privacy_host:'',onboarding_completed:false
 };
 
 const THEMES=[
@@ -45,6 +45,10 @@ function spkColor(i){
   return SPK_COLORS[index];
 }
 function spkName(i){return (cur&&cur.speakers&&cur.speakers[String(i)])||('说话人'+(i+1));}
+function speakerIndexes(record=cur){
+  return [...new Set(((record&&record.segments)||[]).map(segment=>Number(segment.spk)||0))].sort((a,b)=>a-b);
+}
+function shouldShowSpeakerIdentity(record=cur){return Boolean(record&&speakerIndexes(record).length>0);}
 let toastTimer=0;
 function toast(msg,action){const t=$('#toast'),text=$('#toastText'),button=$('#toastAction');text.textContent=msg;button.classList.toggle('hidden',!action);button.onclick=async()=>{if(action)await action();t.classList.remove('show');};t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),action?5000:2200);}
 function setBanner(text){const b=$('#liveBanner');b.textContent=text||'';b.classList.toggle('hidden',!text);}
@@ -520,17 +524,25 @@ $('#historyContextMenu').addEventListener('click',async event=>{
 
 /* ---------- 打开一条 ---------- */
 async function openItem(id, keepScroll){
-  const sameItem = cur && cur.id === id;
-  cur = await API.open_item(id);
+  leaveLiveRecordingUI();
+  const sameItem = cur && cur.id === id && !cur.live;
+  const opened = await API.open_item(id);
+  if(!opened||opened.ok===false){
+    toast(opened&&opened.message||'无法打开这条文稿');
+    updateBackgroundRecordingBar(liveRecordingState);
+    return;
+  }
+  cur = opened;
   appSettings.last_item_id=id;
   if(API.update_settings) API.update_settings({last_item_id:id}).catch(()=>{});
   $('#empty').classList.add('hidden');
   $('#content').classList.remove('hidden');
   $('#docTitle').textContent = cur.title;
   $('#docEyebrow').textContent = `${cur.created||'今天'} · 本地文稿`;
+  const participantCount=speakerIndexes(cur).length;
   $('#docMeta').textContent = cur.spk_pending
     ? `${fmt(cur.duration)} · 初稿`
-    : `${fmt(cur.duration)} · ${Object.keys(cur.speakers).length}位说话人`;
+    : participantCount>0?`${fmt(cur.duration)} · ${participantCount}位说话人`:`${fmt(cur.duration)} · 录音文稿`;
   $('#docStatus').textContent=cur.spk_pending?'处理中':'已完成';
   $('#fileFormat').textContent=cur.audio_format||'音频';
   $('#fileDuration').textContent=fmt(cur.duration);
@@ -556,6 +568,7 @@ async function openItem(id, keepScroll){
   }
   setView('transcript');
   await loadHistory();
+  updateBackgroundRecordingBar(liveRecordingState);
 }
 
 /* ---------- 顶部说话人标签（点一下改全部） ---------- */
@@ -563,7 +576,10 @@ function renderSpkBar(){
   const bar=$('#spkBar'); if(!bar) return;
   bar.innerHTML='';
   const list=$('#speakerList'); if(list) list.innerHTML='';
-  const idxs=[...new Set(cur.segments.map(s=>s.spk))].sort((a,b)=>a-b);
+  const idxs=speakerIndexes(cur),showIdentity=shouldShowSpeakerIdentity(cur);
+  bar.classList.toggle('hidden',!showIdentity);
+  const section=$('.speaker-inspector');if(section)section.classList.toggle('hidden',!showIdentity);
+  if(!showIdentity)return;
   idxs.forEach(i=>{
     const chip=document.createElement('span');
     chip.className='spk-chip'; chip.style.background=spkColor(i); chip.dataset.spk=i;
@@ -609,22 +625,79 @@ function beginInlineSpeakerRename(i,element){
   element.onblur=()=>finish(!cancelled);
 }
 
+function createOrbitMark(extraClass=''){
+  const source=document.querySelector('#empty .empty-mark');
+  if(!source)return null;
+  const mark=source.cloneNode(true);
+  if(extraClass)mark.classList.add(extraClass);
+  const path=mark.querySelector('#wordgrab-title-arc');
+  const textPath=mark.querySelector('textPath');
+  if(path&&textPath){
+    const uniqueId='wordgrab-title-arc-'+Math.random().toString(36).slice(2);
+    path.id=uniqueId;
+    textPath.setAttribute('href','#'+uniqueId);
+  }
+  return mark;
+}
+
+function getLiveTranscriptState(record){
+  if(!record||!record.live)return 'transcript';
+  if(Array.isArray(record.segments)&&record.segments.length)return 'transcript';
+  if(record.model_status==='preparing')return 'model-loading';
+  if(record.model_status==='error')return 'model-error';
+  return 'ready';
+}
+
 function renderTranscript(){
   const box=$('#transcript'); box.innerHTML='';
+  const liveState=getLiveTranscriptState(cur);
+  if(liveState==='model-loading'){
+    const placeholder=document.createElement('div');
+    placeholder.className='live-transcript-empty is-loading';
+    const mark=createOrbitMark('live-empty-mark');
+    if(mark)placeholder.appendChild(mark);
+    box.appendChild(placeholder);
+    return;
+  }
+  if(liveState==='ready'||liveState==='model-error'){
+    const placeholder=document.createElement('div');
+    placeholder.className='live-transcript-empty '+(
+      liveState==='model-error'?'is-error':'is-ready'
+    );
+    placeholder.innerHTML=liveState==='model-error'
+      ?`<div class="live-ready-copy">
+          <strong>实时字幕暂时不可用</strong>
+          <span>录音仍在完整保存，结束后会生成最终文稿</span>
+        </div>`
+      :`<div class="live-ready-wave" aria-hidden="true">
+          <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+        </div>
+        <div class="live-ready-copy">
+          <strong>实时字幕已开启</strong>
+          <span>开始说话，确认后的句子会显示在这里</span>
+        </div>`;
+    box.appendChild(placeholder);
+    return;
+  }
+  const showIdentity=shouldShowSpeakerIdentity(cur);
   cur.segments.forEach((s,idx)=>{
     const color=spkColor(s.spk);
     const el=document.createElement('div');
-    el.className='seg'+(idx===0&&audio.currentTime<.25?' active':''); el.dataset.start=s.start; el.dataset.idx=idx; el.tabIndex=0; el.setAttribute('role','button'); el.setAttribute('aria-label',`${spkName(s.spk)}，${fmt(s.start/1000)}，按回车播放`);
-    el.innerHTML=`
-      <div class="seg-avatar" style="background:${color}">${spkName(s.spk).slice(-2)}</div>
-      <div class="seg-body">
-        <div class="seg-top">
-          <span class="seg-name" style="color:${color}" data-spk="${s.spk}" title="双击改名">${escapeHtml(spkName(s.spk))}</span>
-          <button class="seg-rename-btn" data-spk="${s.spk}" title="改名" aria-label="改名">改名</button>
-          <span class="seg-time">${fmt(s.start/1000)}</span>
-        </div>
-        <div class="seg-text" contenteditable="true" spellcheck="false" data-idx="${idx}" title="点击编辑，失焦后保存">${escapeHtml(s.text)}</div>
-      </div>`;
+    el.className='seg'+(showIdentity?'':' no-speaker')+(idx===0&&audio.currentTime<.25?' active':''); el.dataset.start=s.start; el.dataset.idx=idx; el.tabIndex=0; el.setAttribute('role','button'); el.setAttribute('aria-label',showIdentity?`${spkName(s.spk)}，${fmt(s.start/1000)}，按回车播放`:`${fmt(s.start/1000)}，按回车播放`);
+    el.innerHTML=showIdentity?`
+        <div class="seg-avatar" style="background:${color}">${spkName(s.spk).slice(-2)}</div>
+        <div class="seg-body">
+          <div class="seg-top">
+            <span class="seg-name" style="color:${color}" data-spk="${s.spk}" title="双击改名">${escapeHtml(spkName(s.spk))}</span>
+            <button class="seg-rename-btn" data-spk="${s.spk}" title="改名" aria-label="改名">改名</button>
+            <span class="seg-time">${fmt(s.start/1000)}</span>
+          </div>
+          <div class="seg-text" contenteditable="true" spellcheck="false" data-idx="${idx}" title="点击编辑，失焦后保存">${escapeHtml(s.text)}</div>
+        </div>`:`
+        <div class="seg-body">
+          <div class="seg-top"><span class="seg-time">${fmt(s.start/1000)}</span></div>
+          <div class="seg-text" contenteditable="true" spellcheck="false" data-idx="${idx}" title="点击编辑，失焦后保存">${escapeHtml(s.text)}</div>
+        </div>`;
     el.onclick=(e)=>{ if(e.target.closest('.seg-name,.seg-rename-btn,.seg-text'))return; seekTo(s.start/1000); };
     el.onkeydown=e=>{if((e.key==='Enter'||e.key===' ')&&!e.target.closest('.seg-text,.seg-name,.seg-rename-btn')){e.preventDefault();seekTo(s.start/1000);}};
     box.appendChild(el);
@@ -1065,7 +1138,214 @@ async function doImport(){
   }
 }
 $('#importBtn').onclick=doImport;
-$('#importBtn2').onclick=doImport;
+
+let liveRecordingId='';
+let liveRecordingTimer=0;
+let liveSegmentsVersion='';
+let liveRecordingState=null;
+let livePollBusy=false;
+function setRecordingControls(status){
+  const recording=['recording','paused'].includes(status);
+  $('.sidebar-actions').classList.toggle('is-recording',recording);
+  $('.record-controls').classList.toggle('is-recording',recording);
+  $('#recordBtn').classList.toggle('hidden',recording);
+  $('#pauseRecordBtn').classList.toggle('hidden',!recording);
+  $('#stopRecordBtn').classList.toggle('hidden',!recording);
+  $('#pauseRecordBtn').textContent=status==='paused'?'继续':'暂停';
+  $('#pauseRecordBtn').disabled=!recording;
+  $('#recordBtn').disabled=['starting','preparing','stopping'].includes(status);
+  $('#recordBtn').textContent=status==='starting'?'启动中…':'录音';
+}
+function setLiveCaption(state={}){
+  const caption=$('#liveCaption'),status=state.status||'recording';
+  const modelStatus=state.model_status||'ready';
+  const modelPreparing=modelStatus==='preparing';
+  const modelFailed=modelStatus==='error';
+  const labels={preparing:'正在准备',recording:'正在听',paused:'已暂停',stopping:'正在保存',finalizing:'正在生成文稿'};
+  caption.classList.remove('is-preparing','is-paused','is-stopping','is-finalizing');
+  if(status!=='recording')caption.classList.add('is-'+status);
+  if(modelPreparing)caption.classList.add('is-preparing');
+  const text=(state.caption_text||'').trim();
+  caption.classList.toggle('is-placeholder',!text);
+  $('#liveCaptionTime').textContent=fmt(state.duration||0);
+  const lag=Math.max(0,Number(state.lag_seconds)||0),queueLag=Math.max(0,Number(state.queue_seconds)||0);
+  const displayLag=Math.max(lag,queueLag);
+  let lagText='字幕同步';
+  if(status==='finalizing')lagText='实时字幕已归档';
+  else if(status==='stopping')lagText='正在处理剩余音频';
+  else if(modelPreparing)lagText='字幕模型准备中';
+  else if(modelFailed)lagText='实时字幕不可用';
+  else if(status==='preparing')lagText='正在加载并预热模型';
+  else if(state.live_degraded||displayLag>4)lagText=`字幕落后 ${displayLag.toFixed(1)} 秒`;
+  else if(displayLag>1.2)lagText=`字幕延迟 ${displayLag.toFixed(1)} 秒`;
+  $('#liveCaptionLabel').textContent=status==='recording'&&modelPreparing
+    ?'录音中'
+    :status==='recording'&&modelFailed
+      ?'录音中'
+      :status==='recording'&&(state.live_degraded||displayLag>4)
+        ?'正在追赶':labels[status]||'正在听';
+  $('#liveCaptionLag').textContent=lagText;
+  $('#liveCaptionText').textContent=text||(
+    status==='stopping'?'正在安全保存录音…'
+      :status==='finalizing'?'录音已结束，正在生成正式文稿…'
+      :modelPreparing
+      ?(status==='paused'
+        ?'录音已暂停，字幕模型仍在准备'
+        :'录音已经开始；字幕准备完成后会从开头追赶转写')
+      :modelFailed
+        ?'录音仍在完整保存，结束后会生成最终文稿'
+        :status==='preparing'?'首次使用可能需要几十秒，准备完成后自动开始录音'
+          :status==='paused'?'录音已暂停'
+            :'正在等待下一句话…'
+  );
+}
+function resetPlaybackForNewRecording(){
+  audio.pause();audio.removeAttribute('src');audio.load();audio.currentTime=0;
+  $('#curTime').textContent='00:00';$('#totTime').textContent='00:00';$('#seek').value=0;
+  $('#fileFormat').textContent='WAV';$('#fileDuration').textContent='00:00';setPlayIcon(false);
+}
+function enterLiveRecordingUI(record){
+  $('#empty').classList.add('hidden');$('#progress').classList.add('hidden');$('#content').classList.remove('hidden');
+  $('#content').classList.add('is-live');$('#liveCaption').classList.remove('hidden');
+  $('#backgroundRecordingBar').classList.add('hidden');
+  setView('transcript');setBanner('');resetPlaybackForNewRecording();
+  const confirmed=Array.isArray(record.confirmed_segments)?record.confirmed_segments:[];
+  cur={id:record.id,title:record.title||'实时录音',duration:Number(record.duration)||0,
+    speakers:{'0':'说话人1'},speaker_colors:{},segments:confirmed.map(segment=>({...segment})),live:true};
+  cur.model_status=record.model_status||'preparing';
+  liveSegmentsVersion=confirmed.length
+    ?`${confirmed.length}:${confirmed[confirmed.length-1].end}:${confirmed[confirmed.length-1].text}`:'0';
+  $('#docTitle').textContent=cur.title;$('#docEyebrow').textContent='实时录音 · '+fmt(cur.duration);
+  $('#docMeta').textContent=record.stage||'正在录音并生成字幕…';$('#docStatus').textContent='录音中';
+  renderTranscript();renderSpkBar();setLiveCaption(record);
+}
+function leaveLiveRecordingUI(){
+  $('#content').classList.remove('is-live');$('#liveCaption').classList.add('hidden');
+}
+function isViewingLiveRecording(){
+  return Boolean(liveRecordingId&&cur&&cur.id===liveRecordingId&&cur.live);
+}
+function updateBackgroundRecordingBar(state){
+  const bar=$('#backgroundRecordingBar');
+  if(!bar)return;
+  const status=state&&state.status;
+  const finished=!state||['done','error'].includes(status);
+  const show=!finished&&!isViewingLiveRecording()&&!$('#content').classList.contains('hidden');
+  bar.classList.toggle('hidden',!show);
+  if(!show)return;
+  bar.classList.toggle('is-paused',status==='paused');
+  bar.classList.toggle('is-processing',['stopping','finalizing'].includes(status));
+  const labels={
+    recording:'正在录音',paused:'录音已暂停',stopping:'正在保存录音',finalizing:'最终文稿处理中'
+  };
+  $('#backgroundRecordingLabel').textContent=labels[status]||'录音任务';
+  $('#backgroundRecordingTime').textContent=fmt(state.duration||0);
+  $('#backgroundRecordingStage').textContent=state.stage||(
+    status==='finalizing'?'录音已保存，可正常播放':'后台录音持续进行'
+  );
+  $('.background-recording-return').textContent=status==='finalizing'?'查看这条录音 →':'返回实时录音 →';
+}
+async function pollLiveRecording(){
+  if(!liveRecordingId||livePollBusy)return;
+  livePollBusy=true;
+  try{
+    const polledId=liveRecordingId;
+    const state=await API.recording_status(polledId);
+    if(!state||state.ok===false){
+      clearInterval(liveRecordingTimer);liveRecordingTimer=0;liveRecordingId='';liveRecordingState=null;
+      leaveLiveRecordingUI();updateBackgroundRecordingBar(null);return;
+    }
+    liveRecordingState={...state,id:polledId};
+    setRecordingControls(state.status);
+
+    // 结束保存后，实时页立即转成普通文稿页并恢复播放器；
+    // 如果用户正在查看别的文稿，则完全不碰当前正文与播放器。
+    if(state.status==='finalizing'&&isViewingLiveRecording()){
+      leaveLiveRecordingUI();
+      await loadHistory();
+      try{await openItem(polledId,true);}catch(_){updateBackgroundRecordingBar(liveRecordingState);}
+    }else if(isViewingLiveRecording()){
+      $('#empty').classList.add('hidden');$('#content').classList.remove('hidden');$('#content').classList.add('is-live');
+      $('#docTitle').textContent=state.title||'实时录音';
+      $('#docEyebrow').textContent='实时录音 · '+fmt(state.duration);
+      $('#docMeta').textContent=state.stage||'正在录音…';
+      $('#docStatus').textContent=state.status==='paused'?'已暂停':state.status==='stopping'?'正在保存':'录音中';
+      cur.duration=Number(state.duration)||0;
+      const previousModelStatus=cur.model_status;
+      cur.model_status=state.model_status||cur.model_status||'preparing';
+      const confirmed=Array.isArray(state.confirmed_segments)?state.confirmed_segments:[];
+      const version=confirmed.length?`${confirmed.length}:${confirmed[confirmed.length-1].end}:${confirmed[confirmed.length-1].text}`:'0';
+      if(version!==liveSegmentsVersion||previousModelStatus!==cur.model_status){
+        liveSegmentsVersion=version;cur.segments=confirmed.map(segment=>({...segment}));
+        renderTranscriptKeepScroll();renderSpkBar();
+      }
+      setLiveCaption(state);
+      if(state.error||state.warning)setBanner(state.error||state.warning);else setBanner('');
+    }else{
+      leaveLiveRecordingUI();
+    }
+    updateBackgroundRecordingBar(liveRecordingState);
+
+    if(state.status==='done'||state.status==='error'){
+      const completedId=polledId,completedError=state.error||'';
+      const viewingCompleted=Boolean(cur&&cur.id===completedId);
+      clearInterval(liveRecordingTimer);liveRecordingTimer=0;
+      setRecordingControls('done');
+      liveRecordingId='';liveRecordingState=null;
+      leaveLiveRecordingUI();updateBackgroundRecordingBar(null);await loadHistory();
+      if(viewingCompleted)await openItem(completedId,true);
+      if(state.status==='done')toast('录音和最终文稿已完成');
+      else{
+        if(viewingCompleted)setBanner(completedError||'录音已保存，但最终转写失败');
+        toast('录音已保存，但最终转写失败');
+      }
+    }
+  }finally{
+    livePollBusy=false;
+  }
+}
+$('#backgroundRecordingBar').onclick=async()=>{
+  if(!liveRecordingId||!liveRecordingState)return;
+  if(liveRecordingState.status==='finalizing'){
+    await openItem(liveRecordingId);
+  }else{
+    enterLiveRecordingUI(liveRecordingState);
+    updateBackgroundRecordingBar(liveRecordingState);
+  }
+};
+$('#recordBtn').onclick=async()=>{
+  try{
+    setRecordingControls('starting');
+    const result=await API.start_recording();
+    if(!result||result.ok===false){setRecordingControls('done');toast(result&&result.message||'无法开始录音');return;}
+    liveRecordingId=result.id;
+    liveRecordingState={...result,status:'recording',model_status:result.model_status||'preparing'};
+    setRecordingControls('recording');
+    enterLiveRecordingUI(liveRecordingState);
+    await loadHistory();
+    clearInterval(liveRecordingTimer);liveRecordingTimer=setInterval(pollLiveRecording,800);pollLiveRecording();
+  }catch(error){toast('无法开始录音：'+error);}
+};
+$('#pauseRecordBtn').onclick=async()=>{
+  if(!liveRecordingId)return;
+  const state=await API.recording_status(liveRecordingId);
+  const ok=state.status==='paused'?await API.resume_recording(liveRecordingId):await API.pause_recording(liveRecordingId);
+  if(ok)pollLiveRecording();
+};
+$('#stopRecordBtn').onclick=async()=>{
+  if(!liveRecordingId)return;
+  const ok=await API.stop_recording(liveRecordingId);
+  if(ok){
+    setRecordingControls('stopping');
+    liveRecordingState={...(liveRecordingState||{}),status:'stopping',stage:'正在保存录音…'};
+    if(isViewingLiveRecording()){
+      const caption=$('#liveCaption');
+      setLiveCaption({...liveRecordingState,
+        caption_text:caption.classList.contains('is-placeholder')?'':$('#liveCaptionText').textContent});
+    }else updateBackgroundRecordingBar(liveRecordingState);
+    await loadHistory();pollLiveRecording();
+  }
+};
 function setExportMenuOpen(open){$('#exportMenu').classList.toggle('hidden',!open);$('#exportBtn').setAttribute('aria-expanded',open?'true':'false');}
 $('#exportBtn').onclick=event=>{event.stopPropagation();setExportMenuOpen($('#exportBtn').getAttribute('aria-expanded')!=='true');};
 document.querySelectorAll('.export-option').forEach(option=>option.onclick=async event=>{event.stopPropagation();setExportMenuOpen(false);if(!cur)return;try{const summaryView=$('#readingGrid').dataset.view==='summary';if(summaryView&&!currentSummary){toast('请先生成 AI 总结');return;}const path=summaryView&&API.export_ai_summary?await API.export_ai_summary(cur.id,option.dataset.format):await API.export_document(cur.id,option.dataset.format);if(path)toast('已导出：'+path.split('/').pop());}catch(error){toast('导出失败：'+error);}});
@@ -1226,7 +1506,7 @@ function initDrop(){
 /* ---------- 浏览器预览数据（只在 ?preview=1 时启用） ---------- */
 function createPreviewApi(){
   let previewSettings={...DEFAULT_APP_SETTINGS,theme:'solar-bloom',export_directory:'~/Documents'};
-  let previewDataPath='~/Library/Application Support/录音转文字/data';
+  let previewDataPath='~/Library/Application Support/WordGrab/data';
   let items=[
     {id:'demo-1',title:'推广管培生招聘需求会',duration:596,created:'2026-07-15 11:57',n_speakers:2},
     {id:'demo-2',title:'宋英剑背调访谈',duration:232,created:'2026-07-10 10:23',n_speakers:3},
@@ -1246,9 +1526,19 @@ function createPreviewApi(){
   };
   let previewSummary=null;
   let previewTemplates=[{id:'general',name:'通用摘要',builtin:true,objective:'完整分析录音内容',focus:['内容概述','关键结论'],detail:'standard'}];
+  let previewRecording=null,previewCaptionStep=0,previewPrepareStep=0;
+  const previewCaptions=[
+    '我们今天主要讨论一下新产品的发布时间',
+    '我们今天主要讨论一下新产品的发布时间，以及上线之前还需要完成的几项准备工作。',
+    '第一项是确认测试范围，第二项是整理用户反馈，最后再决定正式发布的日期。',
+  ];
   return {
     async list_items(){return items;},
-    async open_item(id){return {...sample,id,title:(items.find(x=>x.id===id)||items[0]).title};},
+    async open_item(id){
+      const base={...sample,id,title:(items.find(x=>x.id===id)||items[0]).title};
+      if(id==='demo-5')return {...base,speakers:{'0':'说话人1'},segments:sample.segments.map(segment=>({...segment,spk:0}))};
+      return base;
+    },
     async rename_speaker(id,index,name){sample.speakers[String(index)]=name;return true;},
     async rename_item(id,title){const row=items.find(x=>x.id===id);if(row)row.title=title;return true;},
     async bulk_delete_items(ids){items=items.filter(x=>!ids.includes(x.id));return {ok:true,count:ids.length};},
@@ -1273,6 +1563,49 @@ function createPreviewApi(){
       return {ok:true,data_path:directory,moved:true,message:'文稿和录音已移动到新位置'};
     },
     async start_transcribe(){return null;},
+    async prepare_live_transcription(){return {ok:true,device:'cpu',threads:2,chunk_seconds:1.2,prepare_seconds:.7};},
+    async start_recording(){
+      const id='live-preview-'+Date.now(),title='实时录音 2026-07-22 22-48-16';
+      previewRecording={ok:true,id,title,status:'recording',model_status:'preparing',
+        duration:0,caption_text:'',confirmed_segments:[],lag_seconds:0,queue_seconds:0,
+        stage:'录音已开始，正在准备实时字幕…'};
+      previewCaptionStep=0;previewPrepareStep=0;
+      items=[{id,title,duration:0,created:'2026-07-22 22:48',n_speakers:0,status:'recording'},...items];
+      return {ok:true,id,title,status:'recording',model_status:'preparing',stage:previewRecording.stage};
+    },
+    async recording_status(id){
+      if(!previewRecording||previewRecording.id!==id)return {ok:false,message:'找不到录音任务'};
+      if(previewRecording.status==='recording'){
+        previewRecording.duration+=.8;
+        if(previewRecording.model_status==='preparing'){
+          previewPrepareStep+=1;
+          previewRecording.queue_seconds=previewRecording.duration;
+          if(previewPrepareStep>=3){
+            previewRecording.model_status='ready';
+            previewRecording.stage='录音持续保存，字幕正在从开头追赶…';
+          }
+        }else if(previewRecording.confirmed_segments.length===0){
+          previewCaptionStep=Math.min(previewCaptions.length-1,previewCaptionStep+1);
+          previewRecording.caption_text=previewCaptions[previewCaptionStep];
+          previewRecording.queue_seconds=Math.max(0,previewRecording.queue_seconds-1.3);
+          previewRecording.lag_seconds=previewCaptionStep===1?1.4:.7;
+          if(previewRecording.queue_seconds<=1.2){
+            previewRecording.stage='正在录音并实时转写…';
+          }
+        }
+        if(previewCaptionStep>=2&&previewRecording.confirmed_segments.length===0){
+          previewRecording.confirmed_segments=[
+            {spk:0,start:1200,end:6800,text:'我们今天主要讨论一下新产品的发布时间，以及上线之前还需要完成的几项准备工作。'},
+            {spk:0,start:7200,end:11800,text:'第一项是确认测试范围，第二项是整理用户反馈。'},
+          ];
+          previewRecording.caption_text='最后再决定正式发布的日期。';
+        }
+      }
+      return {...previewRecording};
+    },
+    async pause_recording(){if(!previewRecording)return false;previewRecording.status='paused';previewRecording.stage='已暂停';return true;},
+    async resume_recording(){if(!previewRecording)return false;previewRecording.status='recording';previewRecording.stage='正在录音并生成字幕…';return true;},
+    async stop_recording(){if(!previewRecording)return false;previewRecording.status='finalizing';previewRecording.stage='正在生成正式文稿…';return true;},
     async get_settings(){return {...previewSettings};},
     async update_settings(patch){previewSettings={...previewSettings,...patch};return {...previewSettings};},
     async get_ai_settings(){return {base_url:'https://example.com/v1',model:'summary-model',summary_template:'general',key_configured:true,key_last4:'8K2M'};},
@@ -1292,30 +1625,90 @@ function createPreviewApi(){
       return true;
     },
     async get_system_info(){return {version:'1.1.0',data_path:previewDataPath,data_size:184*1024**2,model_path:'~/.cache/modelscope',model_size:2.9*1024**3,model_ready:true,ffmpeg_ok:true,ffmpeg_path:'/opt/homebrew/bin/ffmpeg'};},
+    async get_model_download_status(){return {status:'completed',progress:1,stage:'语音模型已准备好',info:{}};},
+    async start_model_download(){return {status:'completed',progress:1,stage:'语音模型已准备好',info:{}};},
     async open_local_resource(){return true;},
   };
+}
+
+/* ---------- 首次使用引导 ---------- */
+let onboardingTimer=0;
+function showOnboardingPage(name){
+  document.querySelectorAll('.onboarding-page').forEach(page=>page.classList.toggle('active',page.dataset.onboardingStep===name));
+  const index=['welcome','overview','download','done'].indexOf(name);
+  document.querySelectorAll('.onboarding-steps i').forEach((dot,i)=>dot.classList.toggle('active',i<=Math.min(index,2)));
+}
+function setOnboardingVisible(show){
+  $('#onboarding').classList.toggle('hidden',!show);
+  if(!show) clearInterval(onboardingTimer);
+}
+async function completeOnboarding(){
+  await saveSetting('onboarding_completed',true);
+  setOnboardingVisible(false);
+}
+function formatDownloadMeta(info={}){
+  const downloaded=Number(info.downloaded_mb)||0,total=Number(info.total_mb)||0,speed=Number(info.speed_mb_s)||0;
+  if(total>0){
+    const progress=`${downloaded.toFixed(downloaded<10?1:0)} MB / ${total.toFixed(0)} MB`;
+    return speed>.1?`${progress} · ${speed.toFixed(1)} MB/s`:progress;
+  }
+  return info.current_model?`正在准备：${info.current_model}`:'正在准备下载…';
+}
+function updateOnboardingDownload(state={}){
+  const progress=Math.max(0,Math.min(1,Number(state.progress)||0));
+  $('#onboardingDownloadFill').style.width=`${Math.round(progress*100)}%`;
+  $('#onboardingDownloadPercent').textContent=`${Math.round(progress*100)}%`;
+  $('#onboardingDownloadStage').textContent=state.stage||'正在下载语音模型…';
+  $('#onboardingDownloadMeta').textContent=formatDownloadMeta(state.info);
+  const speed=Number((state.info||{}).speed_mb_s)||0, total=Number((state.info||{}).total_mb)||0, downloaded=Number((state.info||{}).downloaded_mb)||0;
+  $('#onboardingDownloadEta').textContent=speed>.1&&total>downloaded?`约剩 ${Math.ceil((total-downloaded)/speed/60)} 分钟`:'';
+  const failed=state.status==='error';
+  $('#onboardingDownloadError').textContent=failed?(state.error||'下载没有完成，请检查网络后重试。'):'';
+  $('#onboardingDownloadError').classList.toggle('hidden',!failed);
+  $('#onboardingRetry').classList.toggle('hidden',!failed);
+  if(state.status==='completed'){
+    clearInterval(onboardingTimer);
+    showOnboardingPage('done');
+  }
+}
+async function beginModelDownload(){
+  showOnboardingPage('download');
+  $('#onboardingRetry').classList.add('hidden');
+  try{ updateOnboardingDownload(await API.start_model_download()); }
+  catch(_){ updateOnboardingDownload({status:'error',error:'无法开始下载，请检查网络后重试。'}); return; }
+  clearInterval(onboardingTimer);
+  onboardingTimer=setInterval(async()=>{
+    try{updateOnboardingDownload(await API.get_model_download_status());}catch(_){ }
+  },850);
+}
+async function initOnboarding(){
+  if(!API.get_system_info) return;
+  try{
+    const info=await API.get_system_info();
+    if(appSettings.onboarding_completed&&info.model_ready) return;
+    setOnboardingVisible(true);
+    showOnboardingPage(info.model_ready?'done':'welcome');
+  }catch(_){ }
 }
 
 /* ---------- 启动 ---------- */
 async function boot(api,initialId){
   API=api;
   await initSettingsCenter();
-  try{
-    const firstRun=localStorage.getItem('wordgrab-first-run-seen')!=='1';
-    if(firstRun&&API.get_system_info){
-      const info=await API.get_system_info();
-      if(!info.model_ready||!info.ffmpeg_ok){
-        setSettingsOpen(true); showSettingsPage('about');
-        await confirmSettingsAction('首次使用准备',
-          `${info.ffmpeg_ok?'语音模型将在第一次转写时准备。':'尚未找到 FFmpeg，请先安装后再导入音频。'}${info.model_ready?'':'首次转写需要下载约 2GB 本地模型，过程中可以等待或取消。'}`,
-          '知道了');
-        setSettingsOpen(false);
-      }
-      localStorage.setItem('wordgrab-first-run-seen','1');
-    }
-  }catch(_){ }
+  $('#onboardingWelcomeNext').onclick=()=>showOnboardingPage('overview');
+  $('#onboardingDownload').onclick=beginModelDownload;
+  $('#onboardingRetry').onclick=beginModelDownload;
+  $('#onboardingSkip').onclick=completeOnboarding;
+  $('#onboardingFinish').onclick=completeOnboarding;
+  $('#onboardingImport').onclick=async()=>{await completeOnboarding();await doImport();};
+  await initOnboarding();
   initDrop();
   await loadHistory();
+  // 不阻塞界面地提前加载实时模型。用户稍后点击“录音”时，麦克风仍然
+  // 立即开始保存，而字幕通常已经完成冷启动，不再落后二十多秒。
+  if(API.prepare_live_transcription){
+    Promise.resolve(API.prepare_live_transcription()).catch(()=>{});
+  }
   const startupId=initialId||(appSettings.reopen_last&&appSettings.last_item_id);
   if(startupId){
     try{await openItem(startupId);}catch(_){appSettings.last_item_id='';}

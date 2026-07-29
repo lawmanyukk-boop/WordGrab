@@ -8,7 +8,7 @@ FunASR paraformer-zh + fsmn-vad + ct-punc + cam++ 声纹分离
 - transcribe_draft：VAD 切段 → 按块 ASR+标点 → 逐块回调，快出无说话人初稿
 - transcribe_full：完整管线（含 cam++ 声纹分离），慢但结果完整
 """
-import os, subprocess, tempfile, json, threading, shutil
+import os, subprocess, tempfile, json, threading, shutil, gc, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -54,7 +54,31 @@ def _resolve_ffmpeg():
 os.environ.setdefault("MODELSCOPE_CACHE", os.path.expanduser("~/.cache/modelscope"))
 
 _MODEL = None
+_STREAM_MODEL = None
+_STREAM_MODEL_WARMED = False
 _MODEL_LOCK = threading.Lock()  # 预加载线程与转写线程可能同时进入
+_STREAM_MODEL_LOCK = threading.Lock()
+
+# 2026-07-22 在目标 Mac 上用 60 秒真实录音复测：CPU/2 线程、1.2 秒输入块
+# 的实时系数为 0.635；MPS 与 4/8 CPU 线程都慢于实时。流式模型以低延迟
+# 小矩阵为主，线程过多会增加调度争抢，因此这里不是“线程越多越快”。
+STREAMING_DEVICE = "cpu"
+STREAMING_NCPU = 2
+STREAMING_CHUNK_SECONDS = 1.2
+# 在线 Paraformer 在连续讲话时通常要等 is_final 才给出稳定文字。15 秒才
+# 强制结句会让用户误以为实时字幕失效；4.8 秒能在可读性和响应速度间平衡。
+LIVE_UTTERANCE_MAX_SECONDS = 4.8
+LIVE_SILENCE_END_SECONDS = 0.65
+
+
+def _cached_model_path(model_id):
+    """缓存完整时直接使用本地路径，避免每次启动都联网解析模型别名。"""
+    candidate = os.path.join(
+        os.path.expanduser("~/.cache/modelscope/models"), *model_id.split("/")
+    )
+    if os.path.isfile(os.path.join(candidate, "configuration.json")):
+        return candidate
+    return model_id
 
 
 def get_model(progress=None):
@@ -110,6 +134,132 @@ def get_model(progress=None):
                         monitor.stop_monitoring()
 
     return _MODEL
+
+
+def get_streaming_model(progress=None):
+    """加载实时模型。与最终模型分开，便于录音结束后释放。"""
+    global _STREAM_MODEL
+    if _STREAM_MODEL is None:
+        with _STREAM_MODEL_LOCK:
+            if _STREAM_MODEL is None:
+                import torch
+                from funasr import AutoModel
+                _STREAM_MODEL = AutoModel(
+                    model=_cached_model_path(
+                        "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online"
+                    ),
+                    disable_update=True,
+                    device=STREAMING_DEVICE,
+                    ncpu=STREAMING_NCPU,
+                )
+    return _STREAM_MODEL
+
+
+def streaming_model_ready():
+    return _STREAM_MODEL is not None and _STREAM_MODEL_WARMED
+
+
+def prepare_streaming_model():
+    """加载并执行一次静音预热，让录音开始后的首句话不承担冷启动开销。"""
+    global _STREAM_MODEL_WARMED
+    started = time.perf_counter()
+    model = get_streaming_model()
+    if not _STREAM_MODEL_WARMED:
+        import numpy as np
+        model.generate(
+            input=np.zeros(int(16000 * 0.6), dtype="float32"),
+            cache={},
+            chunk_size=[0, 10, 5],
+            encoder_chunk_look_back=4,
+            decoder_chunk_look_back=1,
+            is_final=True,
+            fs=16000,
+            disable_pbar=True,
+        )
+        _STREAM_MODEL_WARMED = True
+    return {
+        "device": STREAMING_DEVICE,
+        "threads": STREAMING_NCPU,
+        "chunk_seconds": STREAMING_CHUNK_SECONDS,
+        "prepare_seconds": round(time.perf_counter() - started, 3),
+    }
+
+
+def release_models():
+    """释放模型引用；由 GC/底层运行时回收模型内存。"""
+    global _MODEL, _STREAM_MODEL, _STREAM_MODEL_WARMED
+    _MODEL = None
+    _STREAM_MODEL = None
+    _STREAM_MODEL_WARMED = False
+    gc.collect()
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def release_streaming_model():
+    """在进入最终转写前释放实时模型，避免两个 ASR 模型同时常驻。"""
+    global _STREAM_MODEL, _STREAM_MODEL_WARMED
+    _STREAM_MODEL = None
+    _STREAM_MODEL_WARMED = False
+    gc.collect()
+
+
+def dedupe_live_text(previous, text):
+    """去掉实时块与上一块之间的常见重复前缀。"""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    previous_text = str((previous[-1] if previous else {}).get("text") or "")
+    if not previous_text:
+        return text
+    if text == previous_text:
+        return ""
+    for size in range(min(len(previous_text), len(text)), 0, -1):
+        if previous_text[-size:] == text[:size]:
+            return text[size:].strip()
+    return text
+
+
+def accumulate_live_text(existing, text):
+    """把流式模型的新输出追加到同一条字幕，并处理块边界重复与英文空格。"""
+    existing = str(existing or "").strip()
+    piece = dedupe_live_text([{"text": existing}], text)
+    if not piece:
+        return existing
+    if not existing:
+        return piece
+    needs_space = existing[-1].isascii() and existing[-1].isalnum() \
+        and piece[0].isascii() and piece[0].isalnum()
+    return existing + (" " if needs_space else "") + piece
+
+
+def live_caption_tail(text, limit=64):
+    """返回当前一句话的末尾，保证两行字幕始终露出最新文字。"""
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    tail = text[-limit:]
+    # 英文尽量从单词边界开始；中文没有空格时直接保留最近字符。
+    first_space = tail.find(" ")
+    if 0 < first_space < 24:
+        tail = tail[first_space + 1:]
+    return "…" + tail.lstrip()
+
+
+def should_finalize_live_utterance(silence_seconds, utterance_seconds):
+    """决定实时流何时确认一句，供录音管线和测试共享。"""
+    natural_end = (
+        utterance_seconds >= 1.0
+        and silence_seconds >= LIVE_SILENCE_END_SECONDS
+    )
+    forced_end = utterance_seconds >= LIVE_UTTERANCE_MAX_SECONDS
+    return natural_end or forced_end
 
 
 def probe_duration(path):
@@ -242,11 +392,24 @@ def transcribe(audio_path, progress=None):
 
 
 def merge_by_speaker(segments):
-    """把连续同说话人的句子合并成段，返回 [{spk,start,text}]"""
+    """按说话人合并成易读段落；同一人连续讲话也会按长度和时长换段。"""
     out = []
     for s in segments:
-        if out and out[-1]["spk"] == s["spk"]:
+        same_speaker = out and out[-1]["spk"] == s["spk"]
+        projected_chars = len(out[-1]["text"]) + len(s.get("text", "")) if out else 0
+        projected_ms = int(s.get("end", 0)) - int(out[-1].get("start", 0)) if out else 0
+        if same_speaker and projected_chars <= 140 and projected_ms <= 25000:
             out[-1]["text"] += s["text"]
+            out[-1]["end"] = s.get("end", out[-1].get("end", 0))
         else:
-            out.append({"spk": s["spk"], "start": s["start"], "text": s["text"]})
+            out.append({"spk": s["spk"], "start": s["start"],
+                        "end": s.get("end", s["start"]), "text": s["text"]})
     return out
+
+
+def normalize_speaker_ids(segments):
+    """把 Cam++ 可能产生的非连续说话人编号整理为 0..N-1。"""
+    ids = sorted({int(segment.get("spk", 0)) for segment in segments})
+    mapping = {speaker_id: index for index, speaker_id in enumerate(ids)}
+    return [{**segment, "spk": mapping.get(int(segment.get("spk", 0)), 0)}
+            for segment in segments]

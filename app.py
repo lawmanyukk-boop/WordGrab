@@ -3,14 +3,43 @@
 """WordGrab · 桌面 GUI（pywebview）
 左侧历史 + 文稿点读联动 + 播放器 + 说话人改名 + 搜索 + 导出
 """
-import os, sys, json, time, uuid, shutil, threading, datetime, re, subprocess, hashlib, sqlite3
+import os, sys, json, time, uuid, shutil, threading, datetime, re, subprocess, hashlib, sqlite3, queue
 import ai_service
+import paths
+import store
+from store import (
+    atomic_write_json,
+    audio_path_of,
+    ensure_speaker_colors,
+    item_dir,
+    latest_export_path,
+    load_item,
+    make_speaker_colors,
+    record_export_path,
+    save_item,
+)
+from exporters import (
+    EXPORT_BLOCK_MAX_CHARS,
+    EXPORT_COLORS,
+    build_export_rows,
+    ai_summary_export_payload,
+    export_payload,
+    format_export_time,
+    split_export_text,
+    write_ai_docx_export,
+    write_ai_pdf_export,
+    write_docx_export,
+    write_pdf_export,
+    write_txt_export,
+)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI = os.path.join(HERE, "ui")
-DEFAULT_DATA = os.path.join(HERE, "data")
-STORAGE_CONFIG = os.path.join(HERE, "storage.json")
+APP_SUPPORT = (os.path.expanduser("~/Library/Application Support/WordGrab")
+               if sys.platform == "darwin" else HERE)
+DEFAULT_DATA = os.path.join(APP_SUPPORT, "data")
+STORAGE_CONFIG = os.path.join(APP_SUPPORT, "storage.json")
 
 
 def configured_data_directory():
@@ -36,7 +65,9 @@ INDEX = os.path.join(DATA, "index.json")
 SETTINGS = os.path.join(DATA, "settings.json")
 TRASH = os.path.join(DATA, ".trash")
 INDEX_DB = os.path.join(DATA, "index.db")
-APP_VERSION = "1.2.0"
+paths.configure_data_directory(DATA)
+store.configure_data_directory(DATA)
+APP_VERSION = "1.3.0"
 
 THEME_KEYS = {
     "aurora-sea", "solar-bloom", "lavender-haze", "tide-ember",
@@ -65,6 +96,7 @@ DEFAULT_SETTINGS = {
     "ai_model": "",
     "ai_summary_template": "general",
     "ai_privacy_host": "",
+    "onboarding_completed": False,
 }
 
 SETTING_ENUMS = {
@@ -92,14 +124,58 @@ PROGRESS = {}                      # iid -> {stage, pct, info, status, msg, titl
 AI_TASKS = {}                      # task_id -> AI 总结任务状态
 AI_TASKS_LOCK = threading.RLock()
 TRANSCRIBE_LOCK = threading.Lock()  # 序列化转写，避免并发共用同一个模型实例出错
+LIVE_RECORDINGS = {}                 # iid -> live recording runtime state
+LIVE_RECORDINGS_LOCK = threading.RLock()
+FINALIZE_CONDITION = threading.Condition(LIVE_RECORDINGS_LOCK)
+FINALIZE_QUEUE = []                   # 录音最终处理严格按结束顺序排队
+FINALIZE_IDLE_SECONDS = 12.0           # 连续录音保留流式模型，空闲后才做最终处理
+LAST_LIVE_ENDED_AT = 0.0
 DELETED = set()                    # 转写期间被用户删除的 iid，两阶段落盘前都要检查
+MODEL_DOWNLOAD = {"status": "idle", "progress": 0, "stage": "", "info": {}, "error": ""}
+MODEL_DOWNLOAD_LOCK = threading.RLock()
+MODEL_DOWNLOAD_THREAD = None
 _DRAG_STRIP_CLASS = None           # macOS 原生透明拖动带（延迟创建，避免非 macOS 导入 AppKit）
 _DRAG_STRIPS = {}                  # NSWindow id -> drag view，持有引用避免被回收
 _DRAG_OBSERVERS = {}               # NSWindow id -> 通知监听状态，缩放/全屏后重新定位拖动带
+_INSTANCE_LOCK_HANDLE = None       # 持有文件锁，防止 App 与源码同时打开两个窗口
+_LIVE_PREPARE_THREAD = None        # 后台预热不能占住前端调用，录音点击始终优先
+
+
+def acquire_single_instance():
+    """macOS 只允许一个 WordGrab 主窗口进程。"""
+    global _INSTANCE_LOCK_HANDLE
+    if sys.platform != "darwin":
+        return True
+    import fcntl
+
+    lock_dir = APP_SUPPORT
+    os.makedirs(lock_dir, exist_ok=True)
+    handle = open(os.path.join(lock_dir, ".instance.lock"), "a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        try:
+            subprocess.run(
+                ["osascript", "-e", 'tell application "WordGrab" to activate'],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return False
+    handle.seek(0)
+    handle.truncate()
+    handle.write(str(os.getpid()))
+    handle.flush()
+    _INSTANCE_LOCK_HANDLE = handle
+    return True
 
 # ---------- 历史存储 ----------
 
-def atomic_write_json(path, value):
+def _legacy_atomic_write_json(path, value):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = path + ".tmp"
     with open(temporary, "w", encoding="utf-8") as file:
@@ -197,7 +273,7 @@ def normalize_settings(data=None):
     if out["default_speed"] not in {0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0}:
         out["default_speed"] = 1.0
     for key in ("reopen_last", "auto_open_import", "auto_diarization",
-                "delete_audio_with_transcript"):
+                "delete_audio_with_transcript", "onboarding_completed"):
         out[key] = bool(out[key])
     out["last_item_id"] = str(out.get("last_item_id") or "")
     out["ai_base_url"] = str(out.get("ai_base_url") or "").strip().rstrip("/")
@@ -254,6 +330,7 @@ def _set_data_globals(directory):
     SETTINGS = os.path.join(DATA, "settings.json")
     TRASH = os.path.join(DATA, ".trash")
     INDEX_DB = os.path.join(DATA, "index.db")
+    store.configure_data_directory(DATA)
 
 
 def _save_data_directory_pointer(directory):
@@ -373,27 +450,23 @@ def preserve_item_audio(iid, title):
     return target
 
 
-EXPORT_COLORS = (
-    "#FF5C4D", "#FF9F1C", "#FFD23F", "#2EC4B6",
-    "#3A86FF", "#8338EC", "#FF4D8D", "#10B981",
-)
 SPEAKER_COLOR_POOL = (
     "#FF675B", "#FF9F1C", "#F59E0B", "#FFD23F",
     "#84CC16", "#10B981", "#14B8A6", "#06B6D4",
     "#3A86FF", "#6366F1", "#8338EC", "#A855F7",
     "#D946EF", "#EC4899", "#F43F5E", "#EF4444",
 )
-EXPORT_BLOCK_MAX_CHARS = 320
+_LEGACY_EXPORT_BLOCK_MAX_CHARS = 320
 
 
-def format_export_time(milliseconds):
+def _legacy_format_export_time(milliseconds):
     seconds = max(0, int(milliseconds or 0) // 1000)
     hours, remainder = divmod(seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def split_export_text(text, limit=EXPORT_BLOCK_MAX_CHARS):
+def _legacy_split_export_text(text, limit=_LEGACY_EXPORT_BLOCK_MAX_CHARS):
     """优先在中文标点处切块，防止一个说话人段落高于整页。"""
     remaining = str(text or "")
     chunks = []
@@ -410,7 +483,7 @@ def split_export_text(text, limit=EXPORT_BLOCK_MAX_CHARS):
     return chunks
 
 
-def build_export_rows(segments, speakers, duration_seconds, speaker_colors=None):
+def _legacy_build_export_rows(segments, speakers, duration_seconds, speaker_colors=None):
     speaker_colors = speaker_colors or {}
     prepared = []
     raw = list(segments or [])
@@ -467,7 +540,7 @@ def build_export_rows(segments, speakers, duration_seconds, speaker_colors=None)
     return merged
 
 
-def export_payload(iid):
+def _legacy_export_payload(iid):
     data = load_item(iid)
     meta = next((item for item in load_index() if item["id"] == iid), {})
     speakers = data.get("speakers", {})
@@ -512,7 +585,7 @@ def export_payload(iid):
     }
 
 
-def ai_summary_export_payload(iid):
+def _legacy_ai_summary_export_payload(iid):
     base = export_payload(iid)
     source_title = base["title"]
     summary = ai_service.load_summary(item_dir(iid))
@@ -611,7 +684,7 @@ def ai_summary_export_payload(iid):
     return base
 
 
-def write_txt_export(path, payload):
+def _legacy_write_txt_export(path, payload):
     lines = [payload["title"], payload["created"], ""]
     for row in payload["rows"]:
         lines.append(
@@ -621,7 +694,7 @@ def write_txt_export(path, payload):
         file.write("\n".join(lines) + "\n")
 
 
-def write_docx_export(path, payload):
+def _legacy_write_docx_export(path, payload):
     import io
     import struct
     import zlib
@@ -923,7 +996,7 @@ def write_docx_export(path, payload):
     document.save(path)
 
 
-def write_pdf_export(path, payload):
+def _legacy_write_pdf_export(path, payload):
     from html import escape
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
@@ -1116,7 +1189,7 @@ def write_pdf_export(path, payload):
     document.build(story, onFirstPage=draw_page_number, onLaterPages=draw_page_number)
 
 
-def write_ai_pdf_export(path, payload):
+def _legacy_write_ai_pdf_export(path, payload):
     """AI 分析专用报告版式：不复用说话人逐段稿结构。"""
     from html import escape
     from reportlab.lib import colors
@@ -1368,7 +1441,7 @@ def write_ai_pdf_export(path, payload):
     document.build(story, onFirstPage=page_furniture, onLaterPages=page_furniture)
 
 
-def write_ai_docx_export(path, payload):
+def _legacy_write_ai_docx_export(path, payload):
     """AI 分析专用 Word 报告，与品牌 PDF 保持同一视觉系统。"""
     from docx import Document
     from docx.enum.section import WD_SECTION
@@ -1611,11 +1684,11 @@ def write_ai_docx_export(path, payload):
     document.save(path)
 
 
-def item_dir(iid):
+def _legacy_item_dir(iid):
     return os.path.join(DATA, iid)
 
 
-def record_export_path(iid, resource, path):
+def _legacy_record_export_path(iid, resource, path):
     """记录最近一次用户导出的成品文件，不暴露内部 JSON 存储。"""
     if resource not in {"document", "summary"} or not path:
         return
@@ -1634,7 +1707,7 @@ def record_export_path(iid, resource, path):
     atomic_write_json(record_path, records)
 
 
-def latest_export_path(iid, resource):
+def _legacy_latest_export_path(iid, resource):
     if resource not in {"document", "summary"}:
         return None
     try:
@@ -1645,12 +1718,12 @@ def latest_export_path(iid, resource):
         return None
 
 
-def load_item(iid):
+def _legacy_load_item(iid):
     with open(os.path.join(item_dir(iid), "transcript.json"), encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_item(iid, data):
+def _legacy_save_item(iid, data):
     path = os.path.join(item_dir(iid), "transcript.json")
     temporary = path + ".tmp"
     with open(temporary, "w", encoding="utf-8") as f:
@@ -1660,7 +1733,7 @@ def save_item(iid, data):
     os.replace(temporary, path)
 
 
-def _valid_hex_color(value):
+def _legacy_valid_hex_color(value):
     if not isinstance(value, str):
         return None
     color = value.strip().upper()
@@ -1669,7 +1742,7 @@ def _valid_hex_color(value):
     return None
 
 
-def _speaker_indexes(data):
+def _legacy_speaker_indexes(data):
     indexes = set()
     for segment in data.get("segments", []) or []:
         try:
@@ -1684,7 +1757,7 @@ def _speaker_indexes(data):
     return sorted(indexes) or [0]
 
 
-def make_speaker_colors(seed, indexes):
+def _legacy_make_speaker_colors(seed, indexes):
     seed = str(seed or uuid.uuid4().hex)
     ranked = sorted(
         (hashlib.sha256(f"{seed}:{color}".encode("utf-8")).hexdigest(), color)
@@ -1697,7 +1770,7 @@ def make_speaker_colors(seed, indexes):
     }
 
 
-def ensure_speaker_colors(iid, data):
+def _legacy_ensure_speaker_colors(iid, data):
     raw = data.get("speaker_colors")
     existing = raw if isinstance(raw, dict) else {}
     changed = not isinstance(raw, dict)
@@ -1718,7 +1791,7 @@ def ensure_speaker_colors(iid, data):
     return colors, changed
 
 
-def audio_path_of(iid):
+def _legacy_audio_path_of(iid):
     d = item_dir(iid)
     for fn in os.listdir(d):
         if fn.startswith("audio"):
@@ -1951,6 +2024,615 @@ class Api:
 
     def update_settings(self, patch):
         return apply_settings_patch(patch)
+
+    # ---------- 首次使用：本地语音模型下载 ----------
+    def get_model_download_status(self):
+        with MODEL_DOWNLOAD_LOCK:
+            return dict(MODEL_DOWNLOAD, info=dict(MODEL_DOWNLOAD.get("info") or {}))
+
+    def start_model_download(self):
+        """在后台下载必需语音模型；前端轮询状态，不从线程直接调用 WebView。"""
+        global MODEL_DOWNLOAD_THREAD
+        info = self.get_system_info()
+        if info["model_ready"]:
+            with MODEL_DOWNLOAD_LOCK:
+                MODEL_DOWNLOAD.update(status="completed", progress=1, stage="语音模型已准备好", error="")
+            return self.get_model_download_status()
+        if MODEL_DOWNLOAD_THREAD and MODEL_DOWNLOAD_THREAD.is_alive():
+            return self.get_model_download_status()
+
+        with MODEL_DOWNLOAD_LOCK:
+            MODEL_DOWNLOAD.update(status="downloading", progress=0, stage="正在准备下载…", info={}, error="")
+
+        def update_progress(stage, progress, details=None):
+            with MODEL_DOWNLOAD_LOCK:
+                MODEL_DOWNLOAD.update(
+                    status="downloading", stage=stage,
+                    progress=float(progress or 0), info=dict(details or {}), error="",
+                )
+
+        def download():
+            try:
+                from model_downloader import download_models_with_progress
+                download_models_with_progress(update_progress)
+                if not self.get_system_info()["model_ready"]:
+                    raise RuntimeError("模型文件未完整下载，请重新尝试")
+                with MODEL_DOWNLOAD_LOCK:
+                    MODEL_DOWNLOAD.update(status="completed", progress=1, stage="语音模型已准备好", error="")
+            except Exception as exc:
+                print(f"[model-download] failed: {exc!r}", flush=True)
+                with MODEL_DOWNLOAD_LOCK:
+                    MODEL_DOWNLOAD.update(status="error", stage="下载未完成", error=str(exc))
+
+        MODEL_DOWNLOAD_THREAD = threading.Thread(target=download, name="wordgrab-model-download", daemon=True)
+        MODEL_DOWNLOAD_THREAD.start()
+        return self.get_model_download_status()
+
+    # ---------- 实时录音 ----------
+    def prepare_live_transcription(self):
+        """录音前加载并预热流式模型，避免首句话承担冷启动开销。"""
+        global _LIVE_PREPARE_THREAD
+        import engine
+        with LIVE_RECORDINGS_LOCK:
+            if any(state.get("status") in {"starting", "recording", "paused", "stopping"}
+                   for state in LIVE_RECORDINGS.values()):
+                return {"ok": False, "message": "已有录音正在进行"}
+            if engine.streaming_model_ready():
+                return {"ok": True, "status": "ready"}
+            if _LIVE_PREPARE_THREAD and _LIVE_PREPARE_THREAD.is_alive():
+                return {"ok": True, "status": "preparing"}
+
+            def prepare_in_background():
+                started = time.perf_counter()
+                try:
+                    with TRANSCRIBE_LOCK:
+                        profile = engine.prepare_streaming_model()
+                    print(
+                        f"[live-asr] 后台预热完成 "
+                        f"({time.perf_counter() - started:.2f}s, "
+                        f"{profile.get('device')}/{profile.get('threads')}线程)",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"[live-asr] 后台预热失败: {exc}", flush=True)
+
+            _LIVE_PREPARE_THREAD = threading.Thread(
+                target=prepare_in_background,
+                name="wordgrab-live-prewarm",
+                daemon=True,
+            )
+            _LIVE_PREPARE_THREAD.start()
+        return {"ok": True, "status": "preparing"}
+
+    def start_recording(self):
+        """立即开始本地录音；模型在识别线程中准备，不阻塞麦克风采集。"""
+        global LAST_LIVE_ENDED_AT
+        import engine
+        import sounddevice as sd
+        import soundfile as sf
+
+        iid = uuid.uuid4().hex[:12]
+        with FINALIZE_CONDITION:
+            if any(state.get("status") in {"starting", "recording", "paused", "stopping"}
+                   for state in LIVE_RECORDINGS.values()):
+                return {"ok": False, "message": "已有录音正在进行"}
+            # 原子占位并唤醒最终处理调度器。只要新录音已经提出，旧文稿就
+            # 不能在“检查状态”和“抢模型锁”之间钻空子。
+            LIVE_RECORDINGS[iid] = {"iid": iid, "status": "starting"}
+            FINALIZE_CONDITION.notify_all()
+
+        try:
+            # 只读取轻量配置，不在这里加载 FunASR。音频必须先开始保存，
+            # 模型冷启动期间积压的音频会在准备完成后从开头追赶识别。
+            stream_profile = {
+                "device": engine.STREAMING_DEVICE,
+                "threads": engine.STREAMING_NCPU,
+                "chunk_seconds": engine.STREAMING_CHUNK_SECONDS,
+                "prepare_seconds": None,
+            }
+
+            base_title = datetime.datetime.now().strftime("实时录音 %Y-%m-%d %H-%M-%S")
+            existing_titles = {item.get("title") for item in load_index()}
+            title = base_title
+            suffix = 2
+            while title in existing_titles:
+                title = f"{base_title} ({suffix})"
+                suffix += 1
+            os.makedirs(item_dir(iid), exist_ok=True)
+            audio_file = os.path.join(item_dir(iid), "audio.wav")
+            sample_rate = 16000
+            audio_queue = queue.Queue()  # 原始录音队列不丢块；写盘与识别分离
+            stop_event = threading.Event()
+            pause_event = threading.Event()
+            state = {
+                "iid": iid, "title": title, "status": "recording",
+                "stage": "录音已开始，正在准备实时字幕…",
+                "model_status": "preparing",
+                "started": time.time(), "duration": 0.0, "partial": [], "draft": [],
+                "confirmed_segments": [], "partial_text": "", "caption_text": "",
+                "current_start_ms": 0, "processed_audio_seconds": 0.0,
+                "lag_seconds": 0.0, "queue_seconds": 0.0,
+                "last_checkpoint": 0.0, "stream_profile": stream_profile,
+                "error": "", "audio_file": audio_file, "sample_rate": sample_rate,
+                "queue": audio_queue, "stop": stop_event, "pause": pause_event,
+                "stream_cache": {},
+            }
+        except Exception as exc:
+            with FINALIZE_CONDITION:
+                LIVE_RECORDINGS.pop(iid, None)
+                FINALIZE_CONDITION.notify_all()
+            return {"ok": False, "message": f"无法创建录音：{exc}"}
+        with LIVE_RECORDINGS_LOCK:
+            LIVE_RECORDINGS[iid] = state
+        with INDEX_LOCK:
+            items = load_index()
+            items.insert(0, {"id": iid, "title": title, "duration": 0,
+                             "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                             "n_speakers": 0, "status": "recording"})
+            save_index(items)
+
+        def audio_callback(indata, frames, callback_time, status):
+            if status:
+                state["error"] = str(status)
+            if not stop_event.is_set() and not pause_event.is_set():
+                try:
+                    audio_queue.put_nowait(indata.copy())
+                except queue.Full:
+                    state["error"] = "实时识别落后，已跳过一个音频块；原始录音仍会继续保存"
+
+        def worker():
+            try:
+                # 最多缓存 6 分钟实时音频（约 23 MB float32）。正常冷启动约 24 秒，
+                # 此余量可以保证模型准备期间开头音频不会被实时字幕队列丢弃。
+                recognition_queue = queue.Queue(maxsize=3600)
+                recognition_stop = object()
+                state["recognition_queue"] = recognition_queue
+
+                def recognize_worker():
+                    import numpy as np
+                    try:
+                        prepare_started = time.perf_counter()
+                        with TRANSCRIBE_LOCK:
+                            prepared_profile = engine.prepare_streaming_model()
+                        print(
+                            f"[live-asr] {iid} 模型就绪 "
+                            f"({time.perf_counter() - prepare_started:.2f}s, "
+                            f"{prepared_profile.get('device')}/"
+                            f"{prepared_profile.get('threads')}线程)",
+                            flush=True,
+                        )
+                        stream_profile.update(prepared_profile)
+                        backlog_seconds = recognition_queue.qsize() * 0.1
+                        with LIVE_RECORDINGS_LOCK:
+                            live = LIVE_RECORDINGS.get(iid)
+                            if live:
+                                live["stream_profile"] = dict(stream_profile)
+                                live["model_status"] = "ready"
+                                live["model_prepare_seconds"] = prepared_profile.get("prepare_seconds")
+                                live["queue_seconds"] = round(backlog_seconds, 2)
+                                if live.get("status") == "recording":
+                                    live["stage"] = (
+                                        "录音持续保存，字幕正在从开头追赶…"
+                                        if backlog_seconds > 1.2
+                                        else "正在录音并实时转写…"
+                                    )
+                    except Exception as exc:
+                        with LIVE_RECORDINGS_LOCK:
+                            live = LIVE_RECORDINGS.get(iid)
+                            if live:
+                                live["model_status"] = "error"
+                                live["warning"] = f"实时字幕不可用：{exc}；录音仍在完整保存"
+                                if live.get("status") == "recording":
+                                    live["stage"] = "正在录音；实时字幕暂时不可用"
+                        # 实时模型失败只降级字幕。持续清空队列，直到录音结束；
+                        # WAV 与结束后的最终文稿流程保持独立。
+                        while recognition_queue.get() is not recognition_stop:
+                            pass
+                        return
+
+                    buffer = []
+                    buffered = 0
+                    silence_seconds = 0.0
+                    utterance_seconds = 0.0
+                    target_samples = int(sample_rate * stream_profile["chunk_seconds"])
+
+                    def flush_buffer(final=False):
+                        nonlocal buffer, buffered, silence_seconds, utterance_seconds
+                        piece = np.concatenate(buffer) if buffer else np.empty(0, dtype="float32")
+                        buffer = []
+                        buffered = 0
+                        self._recognize_live_chunk(iid, piece, sample_rate, is_final=final)
+                        if final:
+                            silence_seconds = 0.0
+                            utterance_seconds = 0.0
+
+                    while True:
+                        block = recognition_queue.get()
+                        if block is recognition_stop:
+                            flush_buffer(final=True)
+                            break
+                        mono = block[:, 0]
+                        block_seconds = len(mono) / sample_rate
+                        rms = float(np.sqrt(np.mean(np.square(mono)))) if len(mono) else 0.0
+                        buffer.append(mono)
+                        buffered += len(mono)
+                        utterance_seconds += block_seconds
+                        silence_seconds = silence_seconds + block_seconds if rms < 0.008 else 0.0
+                        final_boundary = engine.should_finalize_live_utterance(
+                            silence_seconds, utterance_seconds
+                        )
+                        if buffered >= target_samples or final_boundary:
+                            flush_buffer(final=final_boundary)
+                        with LIVE_RECORDINGS_LOCK:
+                            live = LIVE_RECORDINGS.get(iid)
+                            if live:
+                                live["queue_seconds"] = round(
+                                    recognition_queue.qsize() * 0.1, 2)
+
+                recognizer = threading.Thread(target=recognize_worker,
+                                              name=f"wordgrab-live-asr-{iid}", daemon=True)
+                with sf.SoundFile(audio_file, mode="w", samplerate=sample_rate,
+                                  channels=1, subtype="PCM_16") as wav:
+                    stream = sd.InputStream(samplerate=sample_rate, channels=1,
+                                            dtype="float32", blocksize=1600,
+                                            callback=audio_callback)
+                    with stream:
+                        # 麦克风流已经启动后才加载模型，确保用户点击后的第一秒
+                        # 先进入 WAV 和待识别队列，不被 FunASR 冷启动阻塞。
+                        recognizer.start()
+                        while not stop_event.is_set() or not audio_queue.empty():
+                            try:
+                                block = audio_queue.get(timeout=0.2)
+                            except queue.Empty:
+                                continue
+                            wav.write(block)  # 原始音频先落盘，永远不因 ASR 变慢而丢失
+                            state["duration"] = wav.frames / sample_rate
+                            if state.get("model_status") != "error":
+                                try:
+                                    recognition_queue.put_nowait(block)
+                                    state["queue_seconds"] = round(
+                                        recognition_queue.qsize() * 0.1, 2)
+                                except queue.Full:
+                                    # 实时字幕可以降级，但原始录音已经安全写入，最终文稿不受影响。
+                                    state["warning"] = "实时字幕已落后，录音仍在完整保存"
+                                    state["live_degraded"] = True
+                # 用户结束录音时不再等待已经严重落后的实时字幕队列。WAV 已经
+                # 完整写盘，尾部文字交给随后执行的最终转写；否则“结束”可能被
+                # 数十秒积压拖住，看起来像软件卡死。
+                dropped_blocks = 0
+                if stop_event.is_set() and recognition_queue.qsize() > 20:
+                    while True:
+                        try:
+                            recognition_queue.get_nowait()
+                            dropped_blocks += 1
+                        except queue.Empty:
+                            break
+                    state["live_degraded"] = True
+                    state["warning"] = "实时字幕尾部由最终文稿补全"
+                    state["queue_seconds"] = 0.0
+                    print(
+                        f"[live-asr] {iid} 结束录音，跳过 {dropped_blocks / 10:.1f}s "
+                        "积压实时字幕，交由最终文稿补全",
+                        flush=True,
+                    )
+                recognition_queue.put(recognition_stop)
+                # 必须等实时推理完全结束后再释放模型，避免最终模型与它并发占用内存。
+                recognizer.join()
+                self._finish_recording(iid)
+            except Exception as exc:
+                self._fail_recording(iid, str(exc))
+
+        record_thread = threading.Thread(target=worker, name=f"wordgrab-record-{iid}", daemon=True)
+        state["thread"] = record_thread
+        record_thread.start()
+        return {
+            "ok": True, "id": iid, "title": title, "status": "recording",
+            "model_status": "preparing", "stage": state["stage"],
+        }
+
+    def _recognize_live_chunk(self, iid, piece, sample_rate, is_final=False):
+        """识别一块连续音频；自然停顿时确认当前句子并归档到实时文稿。"""
+        import engine
+        try:
+            if piece is None or len(piece) == 0:
+                if is_final:
+                    self._commit_live_utterance(iid)
+                return
+            inference_started = time.perf_counter()
+            # 与最终转写共用模型锁，避免两个大型模型同时驻留导致内存峰值。
+            with TRANSCRIBE_LOCK:
+                model = engine.get_streaming_model()
+                with LIVE_RECORDINGS_LOCK:
+                    state = LIVE_RECORDINGS.get(iid)
+                    cache = state.get("stream_cache", {}) if state else {}
+                result = model.generate(
+                    input=piece,
+                    cache=cache,
+                    chunk_size=[0, 10, 5],
+                    encoder_chunk_look_back=4,
+                    decoder_chunk_look_back=1,
+                    is_final=bool(is_final),
+                    fs=sample_rate,
+                    disable_pbar=True,
+                )
+            inference_seconds = time.perf_counter() - inference_started
+            piece_seconds = len(piece) / sample_rate
+            if inference_seconds > max(1.0, piece_seconds):
+                print(
+                    f"[live-asr] {iid} 推理偏慢: "
+                    f"{piece_seconds:.2f}s 音频耗时 {inference_seconds:.2f}s",
+                    flush=True,
+                )
+            text = ((result[0].get("text") or "") if result else "").strip()
+            checkpoint = False
+            with LIVE_RECORDINGS_LOCK:
+                state = LIVE_RECORDINGS.get(iid)
+                if not state:
+                    return
+                state["stream_cache"] = {} if is_final else cache
+                state["last_inference_seconds"] = round(inference_seconds, 3)
+                state["processed_audio_seconds"] += len(piece) / sample_rate
+                state["lag_seconds"] = round(max(
+                    0.0, state.get("duration", 0.0) - state["processed_audio_seconds"]
+                ), 2)
+                if state.get("status") == "recording":
+                    state["stage"] = (
+                        "录音持续保存，字幕正在追赶…"
+                        if max(state["lag_seconds"], state.get("queue_seconds", 0.0)) > 4
+                        else "正在录音并实时转写…"
+                    )
+                previous_text = state.get("partial_text", "")
+                current_text = engine.accumulate_live_text(previous_text, text)
+                if current_text != previous_text:
+                    state["partial_text"] = current_text
+                    state["caption_text"] = engine.live_caption_tail(current_text)
+                if is_final:
+                    checkpoint = self._commit_live_utterance_locked(state)
+                now = time.time()
+                if checkpoint or now - state.get("last_checkpoint", 0) >= 3.0:
+                    state["last_checkpoint"] = now
+                    checkpoint = True
+            if checkpoint:
+                self._checkpoint_live_recording(iid)
+        except Exception as exc:
+            with LIVE_RECORDINGS_LOCK:
+                state = LIVE_RECORDINGS.get(iid)
+                if state:
+                    state["warning"] = f"实时字幕暂时不可用：{exc}"
+
+    def _commit_live_utterance_locked(self, state):
+        text = str(state.get("partial_text") or "").strip()
+        end_ms = int(state.get("processed_audio_seconds", 0) * 1000)
+        if not text:
+            state["current_start_ms"] = max(state.get("current_start_ms", 0), end_ms)
+            state["caption_text"] = ""
+            return False
+        segment = {
+            "spk": 0,
+            "start": int(state.get("current_start_ms", 0)),
+            "end": end_ms,
+            "text": text,
+        }
+        state.setdefault("confirmed_segments", []).append(segment)
+        state["current_start_ms"] = end_ms
+        state["partial_text"] = ""
+        state["caption_text"] = ""
+        state["partial"] = list(state["confirmed_segments"])
+        state["draft"] = list(state["confirmed_segments"])
+        return True
+
+    def _commit_live_utterance(self, iid):
+        with LIVE_RECORDINGS_LOCK:
+            state = LIVE_RECORDINGS.get(iid)
+            if not state:
+                return False
+            changed = self._commit_live_utterance_locked(state)
+        if changed:
+            self._checkpoint_live_recording(iid)
+        return changed
+
+    def _finish_recording(self, iid):
+        global LAST_LIVE_ENDED_AT
+        with FINALIZE_CONDITION:
+            state = LIVE_RECORDINGS.get(iid)
+            if not state:
+                return
+            state["status"] = "finalizing"
+            state["stage"] = "录音完成，最终文稿排队处理中…"
+            state["live_ended_at"] = time.monotonic()
+            LAST_LIVE_ENDED_AT = state["live_ended_at"]
+            if iid not in FINALIZE_QUEUE:
+                FINALIZE_QUEUE.append(iid)
+            FINALIZE_CONDITION.notify_all()
+        with INDEX_LOCK:
+            items = load_index()
+            for item in items:
+                if item.get("id") == iid:
+                    item.update({"duration": state.get("duration", 0), "status": "finalizing"})
+            save_index(items)
+        # 最终转写进入 FIFO 队列。连续录音期间流式模型保持常驻。
+        threading.Thread(target=self._finalize_live_recording, args=(iid,), daemon=True).start()
+
+    def _finalize_live_recording(self, iid):
+        import engine
+        with FINALIZE_CONDITION:
+            state = LIVE_RECORDINGS.get(iid)
+            if not state:
+                return
+            audio_file, title, duration = state["audio_file"], state["title"], state["duration"]
+
+        # 只有在以下条件同时成立时才能取得最终处理权：
+        # 1. 轮到本条；2. 没有实时录音；3. 最近一次录音已空闲足够久；
+        # 4. 模型锁能立即取得。状态检查和抢锁在同一把条件锁内完成，
+        # 从根本上关闭“刚检查完就被下一条录音插入”的竞态窗口。
+        acquired = False
+        while True:
+            with FINALIZE_CONDITION:
+                state = LIVE_RECORDINGS.get(iid)
+                if not state:
+                    if iid in FINALIZE_QUEUE:
+                        FINALIZE_QUEUE.remove(iid)
+                    FINALIZE_CONDITION.notify_all()
+                    return
+                active_live = any(
+                    value.get("status") in {"starting", "recording", "paused", "stopping"}
+                    for value in LIVE_RECORDINGS.values()
+                )
+                queue_ready = bool(FINALIZE_QUEUE) and FINALIZE_QUEUE[0] == iid
+                idle_left = max(
+                    0.0, FINALIZE_IDLE_SECONDS - (time.monotonic() - LAST_LIVE_ENDED_AT)
+                )
+                if queue_ready and not active_live and idle_left <= 0:
+                    acquired = TRANSCRIBE_LOCK.acquire(blocking=False)
+                    if acquired:
+                        state["stage"] = "正在生成最终文稿…"
+                        break
+                FINALIZE_CONDITION.wait(timeout=max(0.2, min(1.0, idle_left or 0.4)))
+
+        wav = None
+        try:
+            # 已确认进入空闲期，此时才释放流式模型并加载完整转写模型。
+            engine.release_streaming_model()
+            wav = engine.to_wav16k(audio_file)
+            segments = engine.transcribe_full(
+                wav,
+                progress=lambda stage, pct, info=None: self._update_live(iid, stage=stage),
+            )
+            settings = load_settings()
+            if not settings["auto_diarization"]:
+                segments = [{**segment, "spk": 0} for segment in segments]
+            segments = engine.normalize_speaker_ids(segments)
+            n_spk = len({s["spk"] for s in segments}) or 1
+            save_item(iid, {"speakers": {str(i): f"说话人{i + 1}" for i in range(n_spk)},
+                            "speaker_colors": make_speaker_colors(iid, range(n_spk)),
+                            "segments": segments, "draft_segments": state.get("draft", []),
+                            "spk_pending": False})
+            with INDEX_LOCK:
+                items = load_index()
+                for item in items:
+                    if item.get("id") == iid:
+                        item.update({"duration": duration, "n_speakers": n_spk, "status": "done"})
+                save_index(items)
+            self._update_live(iid, status="done", stage="完成", final_segments=segments)
+        except Exception as exc:
+            self._fail_recording(iid, str(exc), preserve_draft=True)
+        finally:
+            if wav:
+                try: os.unlink(wav)
+                except OSError: pass
+            engine.release_models()
+            if acquired:
+                TRANSCRIBE_LOCK.release()
+            with FINALIZE_CONDITION:
+                if iid in FINALIZE_QUEUE:
+                    FINALIZE_QUEUE.remove(iid)
+                FINALIZE_CONDITION.notify_all()
+
+    def _checkpoint_live_recording(self, iid, state=None):
+        """每次确认实时文字后落盘，异常退出时仍可恢复初稿。"""
+        with LIVE_RECORDINGS_LOCK:
+            state = state or LIVE_RECORDINGS.get(iid)
+            if not state:
+                return
+            draft = self._live_draft_locked(state)
+            duration = state.get("duration", 0)
+            status = state.get("status", "recording")
+        save_item(iid, {"speakers": {"0": "说话人1"},
+                        "speaker_colors": make_speaker_colors(iid, [0]),
+                        "segments": draft, "draft_segments": draft,
+                        "spk_pending": True, "live_interrupted": False})
+        with INDEX_LOCK:
+            items = load_index()
+            for item in items:
+                if item.get("id") == iid:
+                    item.update({"duration": duration,
+                                 "n_speakers": 1, "status": status})
+            save_index(items)
+
+    def _update_live(self, iid, **changes):
+        with LIVE_RECORDINGS_LOCK:
+            if iid in LIVE_RECORDINGS:
+                LIVE_RECORDINGS[iid].update(changes)
+
+    @staticmethod
+    def _live_draft_locked(state):
+        """组合已确认段落与当前句；调用方必须持有 LIVE_RECORDINGS_LOCK。"""
+        draft = [dict(segment) for segment in state.get("confirmed_segments", [])]
+        partial_text = str(state.get("partial_text") or "").strip()
+        if partial_text:
+            draft.append({
+                "spk": 0,
+                "start": int(state.get("current_start_ms", 0)),
+                "end": int(state.get("processed_audio_seconds", 0) * 1000),
+                "text": partial_text,
+            })
+        return draft
+
+    def _fail_recording(self, iid, message, preserve_draft=False):
+        with LIVE_RECORDINGS_LOCK:
+            state = LIVE_RECORDINGS.get(iid)
+            if not state: return
+            state.update({"status": "error", "stage": "录音处理失败", "error": message})
+            # 即使故障恰好发生在一句话尚未自然停顿时，也不能丢掉字幕条中的文字。
+            draft = self._live_draft_locked(state)
+        with INDEX_LOCK:
+            items = load_index()
+            for item in items:
+                if item.get("id") == iid:
+                    item["status"] = "error"; item["error"] = message
+            save_index(items)
+        # 无论失败发生在哪个阶段都留下可打开的初稿文件。
+        save_item(iid, {"speakers": {"0": "说话人1"},
+                        "speaker_colors": make_speaker_colors(iid, [0]),
+                        "segments": draft, "draft_segments": draft,
+                        "spk_pending": True, "live_interrupted": True})
+
+    def recording_status(self, iid):
+        with LIVE_RECORDINGS_LOCK:
+            state = LIVE_RECORDINGS.get(iid)
+            if not state:
+                return {"ok": False, "message": "找不到录音任务"}
+            return {k: v for k, v in state.items()
+                    if k not in {"queue", "recognition_queue", "stop", "pause", "thread",
+                                 "stream_cache", "_recognition_buffer", "partial_text",
+                                 "draft", "last_checkpoint"}}
+
+    def pause_recording(self, iid):
+        with LIVE_RECORDINGS_LOCK:
+            state = LIVE_RECORDINGS.get(iid)
+            if not state or state.get("status") != "recording": return False
+            state["pause"].set(); state["status"] = "paused"; state["stage"] = "已暂停"
+            return True
+
+    def resume_recording(self, iid):
+        with LIVE_RECORDINGS_LOCK:
+            state = LIVE_RECORDINGS.get(iid)
+            if not state or state.get("status") != "paused": return False
+            state["pause"].clear(); state["status"] = "recording"; state["stage"] = "正在录音…"
+            return True
+
+    def stop_recording(self, iid):
+        with LIVE_RECORDINGS_LOCK:
+            state = LIVE_RECORDINGS.get(iid)
+            if not state or state.get("status") not in {"recording", "paused"}: return False
+            state["stop"].set(); state["pause"].clear()
+            state["status"] = "stopping"; state["stage"] = "正在保存录音…"
+            return True
+
+    def shutdown_recordings(self, *_args):
+        """窗口关闭时先停止采集，让 WAV 文件头和实时初稿有机会安全落盘。"""
+        threads = []
+        with LIVE_RECORDINGS_LOCK:
+            for state in LIVE_RECORDINGS.values():
+                if state.get("status") in {"recording", "paused", "stopping"}:
+                    state["stop"].set()
+                    state["pause"].clear()
+                    thread = state.get("thread")
+                    if thread:
+                        threads.append(thread)
+        for thread in threads:
+            thread.join(timeout=5)
+        return True
 
     # AI 总结：只支持用户配置的 OpenAI 兼容接口，Key 存在本机受限文件中。
     def get_ai_settings(self):
@@ -2243,7 +2925,7 @@ class Api:
             "data_size": path_size(DATA),
             "model_path": os.path.expanduser("~/.cache/modelscope"),
             "model_size": sum(path_size(path) for path in caches),
-            "model_ready": bool(caches),
+            "model_ready": len(caches) >= len(MODEL_CACHE_MARKERS),
             "ffmpeg_ok": ffmpeg_ok,
             "ffmpeg_path": ffmpeg_path,
         }
@@ -2288,7 +2970,25 @@ class Api:
     # 打开某条：返回合并后的分段 + 说话人名 + 音频地址
     def open_item(self, iid):
         import engine
-        data = load_item(iid)
+        try:
+            data = load_item(iid)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            # 录音刚建立、异常退出或旧版本写盘中断时，历史列表可能先于
+            # transcript.json 存在。返回可理解的状态，避免前端整页失效。
+            audio_path = audio_path_of(iid)
+            if not audio_path:
+                return {"ok": False, "message": "这条记录的文稿和录音文件不完整"}
+            meta = next((x for x in load_index() if x["id"] == iid), {})
+            data = {
+                "speakers": {"0": "说话人1"},
+                "speaker_colors": make_speaker_colors(iid, [0]),
+                "segments": [],
+                "draft_segments": [],
+                "spk_pending": True,
+                "live_interrupted": True,
+            }
+            save_item(iid, data)
+            print(f"[storage] 已修复缺失文稿: {iid} ({meta.get('title', '')})", flush=True)
         speaker_colors, colors_changed = ensure_speaker_colors(iid, data)
         if colors_changed:
             save_item(iid, data)
@@ -2433,6 +3133,7 @@ class Api:
                 segments = engine.transcribe_full(wav, progress=prog, mode=transcription_mode)
                 if not auto_diarization:
                     segments = [{**segment, "spk": 0} for segment in segments]
+                segments = engine.normalize_speaker_ids(segments)
                 n_spk = len({s["spk"] for s in segments}) or 1
                 speakers = {str(i): f"说话人{i + 1}" for i in range(n_spk)}
 
@@ -2485,6 +3186,7 @@ class Api:
                         os.unlink(wav)
                     except OSError:
                         pass
+                engine.release_models()
 
     # 说话人改名
     def rename_speaker(self, iid, spk_index, new_name):
@@ -2581,6 +3283,7 @@ class Api:
                                                   mode=settings["transcription_mode"])
                 if not settings["auto_diarization"]:
                     segments = [{**segment, "spk": 0} for segment in segments]
+                segments = engine.normalize_speaker_ids(segments)
                 speakers = {str(i): f"说话人{i + 1}" for i in sorted({s["spk"] for s in segments})} or {"0": "说话人1"}
                 data = load_item(iid)
                 data.update({"speakers": speakers, "segments": segments, "spk_pending": False})
@@ -2600,9 +3303,14 @@ class Api:
                 if wav:
                     try: os.unlink(wav)
                     except OSError: pass
+                engine.release_models()
 
     # 删除
     def delete_item(self, iid):
+        with LIVE_RECORDINGS_LOCK:
+            live = LIVE_RECORDINGS.get(iid)
+            if live and live.get("status") in {"recording", "paused", "finalizing"}:
+                return {"ok": False, "message": "请先结束当前录音，再删除这条记录"}
         DELETED.add(iid)  # 若该条还在转写，阻止后续阶段把它重新落盘
         items = load_index()
         meta = next((item for item in items if item["id"] == iid), {})
@@ -2745,6 +3453,38 @@ def _preload_model():
         print("[preload] 模型加载完成", flush=True)
     except Exception as e:
         print(f"[preload] 模型加载失败（转写时会重试）: {e!r}", flush=True)
+
+
+def recover_interrupted_recordings():
+    """把上次异常退出的录音标成可恢复状态，保留音频并生成可打开初稿。"""
+    active_statuses = {"recording", "paused", "stopping", "finalizing"}
+    changed = False
+    with INDEX_LOCK:
+        items = load_index()
+        for item in items:
+            if item.get("status") not in active_statuses:
+                continue
+            iid = item.get("id")
+            audio_file = audio_path_of(iid) if iid and os.path.isdir(item_dir(iid)) else None
+            duration = probe = 0.0
+            if audio_file and os.path.isfile(audio_file):
+                try:
+                    import engine
+                    probe = engine.probe_duration(audio_file)
+                except Exception:
+                    probe = 0.0
+                duration = probe or item.get("duration") or 0
+            transcript = os.path.join(item_dir(iid), "transcript.json") if iid else ""
+            if iid and os.path.isdir(item_dir(iid)) and not os.path.isfile(transcript):
+                save_item(iid, {"speakers": {"0": "说话人1"},
+                                "speaker_colors": make_speaker_colors(iid, [0]),
+                                "segments": [], "draft_segments": [],
+                                "spk_pending": True, "live_interrupted": True})
+            item.update({"duration": duration, "status": "error",
+                         "error": "上次录音异常中断，原始录音已保留，可点击重新处理"})
+            changed = True
+        if changed:
+            save_index(items)
 
 
 def _set_dock_icon():
@@ -2983,10 +3723,15 @@ def main():
     global API_REF
     import webview
 
+    if not acquire_single_instance():
+        print("[startup] WordGrab 已在运行，已阻止重复窗口。", flush=True)
+        return
+
     IS_MACOS = sys.platform == "darwin"
 
     api = Api()
     API_REF = api
+    recover_interrupted_recordings()
 
     # Dock 图标设置只在 macOS 执行
     if IS_MACOS:
@@ -2994,7 +3739,7 @@ def main():
 
     port = start_server()
     api.port = port
-    threading.Thread(target=_preload_model, daemon=True).start()
+    # 模型按需加载；避免应用空闲时长期占用数 GB 内存。
 
     # macOS：无边框窗口 + 原生标题栏美化
     # Windows：普通窗口（自带标题栏、关闭按钮、拖动功能）
@@ -3007,6 +3752,7 @@ def main():
         easy_drag=False,
     )
     api.window = window
+    window.events.closing += api.shutdown_recordings
 
     # macOS 专属窗口美化（一体式标题栏、自定义拖动条）
     if IS_MACOS:

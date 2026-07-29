@@ -12,6 +12,10 @@ design-qa.md
 bin/
 WordGrab.app/
 录音转文字.app/
+WordGrab.app/
 dist/
+build/
+Obsidian/
+scripts/update_review_notes.sh
 *.icns.tmp
 storage.json

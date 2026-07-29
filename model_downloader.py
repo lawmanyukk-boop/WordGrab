@@ -140,6 +140,7 @@ def download_models_with_progress(progress_callback=None):
             "iic/speech_campplus_sv_zh-cn_16k-common",
         ]
 
+        failures = []
         for idx, model_id in enumerate(models):
             if progress_callback:
                 progress_callback(
@@ -152,6 +153,10 @@ def download_models_with_progress(progress_callback=None):
                 snapshot_download(model_id, cache_dir=str(monitor.cache_dir))
             except Exception as e:
                 print(f"下载模型时出错: {e}", file=sys.stderr)
+                failures.append(f"{model_id}: {e}")
+
+        if failures:
+            raise RuntimeError("；".join(failures))
 
         if progress_callback:
             progress_callback("模型下载完成", 1.0, {"status": "completed"})

@@ -59,6 +59,7 @@
 ## ✨ 核心功能
 
 ### 🎙️ 专业级转写引擎
+- **实时字幕与最终文稿** - 点击后立即保存声音，字幕模型在后台准备并从开头追赶；结束后再生成高精度正式文稿
 - **说话人自动分离** - 再也不用手动标记"谁说的"，AI 自动识别不同说话人
 - **两阶段转写** - 先快速生成逐步出现的初稿，完整版稍后自动完成
 - **响度智能优化** - 内置响度归一化预处理，就算录音声音小或距离远，也能准确识别
@@ -219,14 +220,15 @@ python transcribe.py 你的录音.m4a
 #### macOS App 打包
 
 ```bash
-# 使用内置脚本打包
+# 使用内置脚本安装到 Applications 目录
 bash scripts/make_app.sh
 
-# 或直接安装到 Applications 目录
-bash scripts/make_app.sh /Applications/WordGrab.app
+# 如需生成到其他位置，可显式传入目标路径
+bash scripts/make_app.sh /path/to/WordGrab.app
 ```
 
-脚本会生成 `WordGrab.app`，可以像其他 macOS 应用一样使用。
+脚本默认安装为 `/Applications/WordGrab.app`，并统一使用
+`~/Library/Application Support/WordGrab` 保存运行环境与用户数据。
 
 #### Windows 可执行文件打包
 

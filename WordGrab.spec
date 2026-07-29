@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller 配置文件 - 用于 Windows 平台打包
 
+import sys
+
 block_cipher = None
 
 a = Analysis(
@@ -18,8 +20,10 @@ a = Analysis(
         'modelscope',
         'torch',
         'torchaudio',
-        'pywebview',
+        'webview',
         'soundfile',
+        'sounddevice',
+        'numpy',
         'imageio_ffmpeg',
         'docx',
         'reportlab',
@@ -65,3 +69,12 @@ coll = COLLECT(
     upx_exclude=[],
     name='WordGrab',
 )
+
+# macOS 使用标准 .app 包；Windows 继续输出 dist/WordGrab 文件夹，供 CI 压缩。
+if sys.platform == 'darwin':
+    app = BUNDLE(
+        coll,
+        name='WordGrab.app',
+        icon='assets/icon.icns',
+        bundle_identifier='com.local.wordgrab',
+    )

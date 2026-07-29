@@ -3,9 +3,10 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP_DIR="${1:-$PROJECT_ROOT/WordGrab.app}"
+APP_DIR="${1:-/Applications/WordGrab.app}"
 CONTENTS_DIR="$APP_DIR/Contents"
-RUNTIME_ROOT="$HOME/Library/Application Support/录音转文字"
+RUNTIME_ROOT="$HOME/Library/Application Support/WordGrab"
+LEGACY_RUNTIME_ROOT="$HOME/Library/Application Support/录音转文字"
 
 if [[ ! -f "$PROJECT_ROOT/app.py" ]]; then
   echo "找不到 app.py，请从项目目录运行此脚本。" >&2
@@ -15,6 +16,13 @@ fi
 if [[ ! -f "$PROJECT_ROOT/assets/icon.icns" ]]; then
   echo "找不到 assets/icon.icns，无法生成 App 图标。" >&2
   exit 1
+fi
+
+# 只在新的统一目录尚不存在时迁移旧运行环境。这样会完整保留虚拟环境、
+# 用户文稿、录音和 API 配置，同时避免电脑里长期维护两套运行文件。
+if [[ ! -e "$RUNTIME_ROOT" && -d "$LEGACY_RUNTIME_ROOT" ]]; then
+  mv "$LEGACY_RUNTIME_ROOT" "$RUNTIME_ROOT"
+  echo "已迁移运行目录：$RUNTIME_ROOT"
 fi
 
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
@@ -39,13 +47,15 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.0</string>
+    <string>1.3.0</string>
     <key>CFBundleVersion</key>
-    <string>1.2.0</string>
+    <string>1.3.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>WordGrab 需要使用麦克风进行本地实时录音和语音转写。</string>
 </dict>
 </plist>
 PLIST
@@ -75,15 +85,35 @@ if [[ -n "$PY_SOURCE" ]]; then
 fi
 # App 源码放在 Application Support，避免 macOS 对桌面目录的应用访问限制。
 mkdir -p "$RUNTIME_ROOT/ui" "$RUNTIME_ROOT/assets"
-cp "$PROJECT_ROOT/app.py" "$PROJECT_ROOT/ai_service.py" "$PROJECT_ROOT/engine.py" "$PROJECT_ROOT/transcribe.py" "$PROJECT_ROOT/requirements.txt" "$PROJECT_ROOT/README.md" "$RUNTIME_ROOT/"
+cp \
+  "$PROJECT_ROOT/app.py" \
+  "$PROJECT_ROOT/ai_service.py" \
+  "$PROJECT_ROOT/engine.py" \
+  "$PROJECT_ROOT/exporters.py" \
+  "$PROJECT_ROOT/model_downloader.py" \
+  "$PROJECT_ROOT/paths.py" \
+  "$PROJECT_ROOT/store.py" \
+  "$PROJECT_ROOT/transcribe.py" \
+  "$PROJECT_ROOT/requirements.txt" \
+  "$PROJECT_ROOT/README.md" \
+  "$RUNTIME_ROOT/"
 cp -R "$PROJECT_ROOT/ui/." "$RUNTIME_ROOT/ui/"
 cp -R "$PROJECT_ROOT/assets/." "$RUNTIME_ROOT/assets/"
+
+# 在生成启动器前验证正式运行目录可以完整导入核心模块。这样新增模块或
+# 重构后的公开函数若未同步，构建会立即失败，不会留下一个打不开的 App。
+VALIDATION_PY="$RUNTIME_ROOT/.venv/bin/python"
+if [[ -x "$VALIDATION_PY" ]]; then
+  PYTHONPATH="$RUNTIME_ROOT" "$VALIDATION_PY" -c \
+    'import app; assert callable(app.make_speaker_colors); assert callable(app.recover_interrupted_recordings)'
+  echo "运行模块自检通过"
+fi
 
 # 生成启动脚本；运行时再定位虚拟环境依赖目录。
 cat > "$CONTENTS_DIR/MacOS/launcher" <<LAUNCHER
 #!/usr/bin/env bash
 DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-PROJECT_ROOT="\$HOME/Library/Application Support/录音转文字"
+PROJECT_ROOT="\$HOME/Library/Application Support/WordGrab"
 cd "\$PROJECT_ROOT" || exit 1
 export MODELSCOPE_CACHE="\$HOME/.cache/modelscope"
 mkdir -p "\$PROJECT_ROOT/data"
@@ -98,10 +128,7 @@ else
   PYTHON="\$PROJECT_ROOT/.venv/bin/python"
 fi
 if [[ ! -x "\$PYTHON" ]]; then
-  PYTHON="\$(command -v python3 || true)"
-fi
-if [[ -z "\$PYTHON" ]]; then
-  echo "未找到 Python 3。请安装 Python 3.9 或更高版本。" >&2
+  echo "WordGrab 的完整运行环境不存在，请重新安装应用运行环境。" >&2
   exit 1
 fi
 
