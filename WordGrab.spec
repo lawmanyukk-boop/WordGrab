@@ -2,8 +2,13 @@
 # PyInstaller 配置文件 - 用于 Windows 平台打包
 
 import sys
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
+funasr_datas = collect_data_files('funasr', includes=['version.txt'])
+modelscope_datas = collect_data_files(
+    'modelscope', includes=['utils/ast_index_file.py'], include_py_files=True
+)
 
 a = Analysis(
     ['app.py'],
@@ -14,10 +19,11 @@ a = Analysis(
         ('assets', 'assets'),
         ('README.md', '.'),
         ('LICENSE', '.'),
-    ],
+    ] + funasr_datas + modelscope_datas,
     hiddenimports=[
         'funasr',
         'modelscope',
+        'modelscope.version',
         'torch',
         'torchaudio',
         'webview',

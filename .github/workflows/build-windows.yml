@@ -35,6 +35,12 @@ jobs:
       - name: Build executable
         run: pyinstaller --clean WordGrab.spec
 
+      - name: Verify packaged speech runtime
+        shell: pwsh
+        run: |
+          & dist\WordGrab\WordGrab.exe --verify-runtime
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Package Windows app
         shell: pwsh
         run: Compress-Archive -Path dist\WordGrab -DestinationPath WordGrab-${{ inputs.release_tag || github.ref_name }}-Windows.zip

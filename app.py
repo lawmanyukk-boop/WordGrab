@@ -3716,8 +3716,28 @@ def _install_native_drag_strip(window):
         print(f"[window] 拖动带安装失败: {e!r}", flush=True)
 
 
+def verify_packaged_runtime():
+    """发布包自检：验证惰性加载的语音依赖和包内资源是否完整。"""
+    import funasr
+    import modelscope
+    import sklearn
+    import torch
+
+    print(json.dumps({
+        "ok": True,
+        "funasr": funasr.__version__,
+        "modelscope": modelscope.__version__,
+        "sklearn": sklearn.__version__,
+        "torch": torch.__version__,
+    }, ensure_ascii=False), flush=True)
+
+
 def main():
     global API_REF
+    if "--verify-runtime" in sys.argv:
+        verify_packaged_runtime()
+        return
+
     import webview
 
     if not acquire_single_instance():
