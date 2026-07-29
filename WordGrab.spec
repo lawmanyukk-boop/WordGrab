@@ -77,4 +77,8 @@ if sys.platform == 'darwin':
         name='WordGrab.app',
         icon='assets/icon.icns',
         bundle_identifier='com.local.wordgrab',
+        info_plist={
+            'CFBundleShortVersionString': '1.3.1',
+            'CFBundleVersion': '1.3.1',
+        },
     )

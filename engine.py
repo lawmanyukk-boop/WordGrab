@@ -81,24 +81,30 @@ def _cached_model_path(model_id):
     return model_id
 
 
+def _disable_modelside_pip_install():
+    """模型附带的 requirements 由发布包预装，禁止在用户设备上再调 pip。"""
+    from funasr.utils import install_model_requirements
+
+    def bundled_requirements(_requirements_path):
+        try:
+            import sklearn  # cam++ 说话人模型的唯一额外依赖
+        except ImportError as exc:
+            raise RuntimeError("语音组件不完整，请重新安装 WordGrab。") from exc
+        return True
+
+    install_model_requirements.install_requirements = bundled_requirements
+
+
 def get_model(progress=None):
     """懒加载单例模型（冷启动约 30-40 秒，app 启动时可后台预加载）
 
-    首次运行会自动下载约 2GB 模型文件，支持进度提示
+    首次运行会自动下载约 3GB 模型文件，支持进度提示
     """
     global _MODEL
     if _MODEL is None:
         with _MODEL_LOCK:
             if _MODEL is None:
-                # 检查模型是否需要下载
-                cache_dir = os.path.expanduser("~/.cache/modelscope")
-                model_exists = os.path.isdir(cache_dir) and any(
-                    os.path.isdir(os.path.join(cache_dir, d))
-                    for d in ["hub", "models"]
-                    if os.path.isdir(os.path.join(cache_dir, d))
-                )
-
-                if not model_exists and progress:
+                if progress:
                     # 首次下载，显示下载进度
                     try:
                         from model_downloader import ModelDownloadMonitor
@@ -115,6 +121,7 @@ def get_model(progress=None):
 
                     import torch
                     from funasr import AutoModel
+                    _disable_modelside_pip_install()
                     device = "mps" if torch.backends.mps.is_available() else "cpu"
 
                     _MODEL = AutoModel(

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""模型下载进度追踪器
-监控 ModelScope 模型下载，提供实时进度反馈
-"""
+"""模型下载进度追踪器。"""
 import os
 import sys
 import threading
@@ -21,7 +19,7 @@ class ModelDownloadMonitor:
         ))
         self.monitoring = False
         self.monitor_thread = None
-        self.total_expected_mb = 2048  # 预估总大小约 2GB
+        self.initial_size_mb = 0
 
     def get_cache_size(self):
         """获取当前缓存目录大小（MB）"""
@@ -44,6 +42,9 @@ class ModelDownloadMonitor:
         if self.monitoring:
             return
 
+        # ModelScope 不会稳定提供总字节数。以本次下载开始前的缓存大小为
+        # 基线，只报告本次新增的数据量，避免伪造一个错误的总大小。
+        self.initial_size_mb = self.get_cache_size()
         self.monitoring = True
         self.monitor_thread = threading.Thread(
             target=self._monitor_loop,
@@ -60,53 +61,20 @@ class ModelDownloadMonitor:
     def _monitor_loop(self):
         """监控循环"""
         last_size = self.get_cache_size()
-        start_time = time.time()
-        stall_count = 0
 
         while self.monitoring:
             time.sleep(2)  # 每2秒检查一次
 
             current_size = self.get_cache_size()
-            progress_pct = min(95, (current_size / self.total_expected_mb) * 100)
-
-            # 计算下载速度
-            elapsed = time.time() - start_time
-            if elapsed > 0:
-                speed_mb_s = (current_size - last_size) / 2  # 2秒间隔
-
-                if speed_mb_s < 0.1:  # 速度很慢或停滞
-                    stall_count += 1
-                else:
-                    stall_count = 0
-
-                # 估算剩余时间
-                if speed_mb_s > 0.1:
-                    remaining_mb = self.total_expected_mb - current_size
-                    eta_seconds = remaining_mb / speed_mb_s
-                    eta_text = f"剩余约 {int(eta_seconds // 60)} 分钟" if eta_seconds > 60 else f"剩余约 {int(eta_seconds)} 秒"
-                else:
-                    eta_text = "正在准备..."
-
-                info = {
-                    "downloaded_mb": round(current_size, 1),
-                    "total_mb": self.total_expected_mb,
+            downloaded_mb = max(0, current_size - self.initial_size_mb)
+            speed_mb_s = max(0, (current_size - last_size) / 2)  # 2秒间隔
+            if self.progress_callback:
+                self.progress_callback("正在下载语音模型…", None, {
+                    "downloaded_mb": round(downloaded_mb, 1),
                     "speed_mb_s": round(speed_mb_s, 2),
-                    "eta": eta_text
-                }
-
-                if self.progress_callback:
-                    self.progress_callback(
-                        f"正在下载模型 ({round(current_size)}MB / {self.total_expected_mb}MB)",
-                        progress_pct / 100,
-                        info
-                    )
+                })
 
             last_size = current_size
-
-            # 如果长时间停滞，可能下载已完成
-            if stall_count > 5 and current_size > 1500:  # 超过1.5GB且停滞
-                break
-
 
 def download_models_with_progress(progress_callback=None):
     """下载模型并显示进度
@@ -114,55 +82,9 @@ def download_models_with_progress(progress_callback=None):
     Args:
         progress_callback: 回调函数 callback(message, progress, info)
     """
-    monitor = ModelDownloadMonitor(progress_callback)
-
-    # 检查模型是否已存在
-    cache_size = monitor.get_cache_size()
-    if cache_size > 1800:  # 已有 1.8GB+ 缓存，认为已下载
-        if progress_callback:
-            progress_callback("模型已就绪", 1.0, {"status": "ready"})
-        return
-
-    if progress_callback:
-        progress_callback("开始下载模型...", 0.0, {"status": "starting"})
-
-    # 启动监控线程
-    monitor.start_monitoring()
-
-    try:
-        # 触发模型加载（会自动下载）
-        from modelscope import snapshot_download
-
-        models = [
-            "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-            "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-            "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
-            "iic/speech_campplus_sv_zh-cn_16k-common",
-        ]
-
-        failures = []
-        for idx, model_id in enumerate(models):
-            if progress_callback:
-                progress_callback(
-                    f"下载模型 {idx + 1}/{len(models)}",
-                    None,
-                    {"current_model": model_id.split("/")[-1]}
-                )
-
-            try:
-                snapshot_download(model_id, cache_dir=str(monitor.cache_dir))
-            except Exception as e:
-                print(f"下载模型时出错: {e}", file=sys.stderr)
-                failures.append(f"{model_id}: {e}")
-
-        if failures:
-            raise RuntimeError("；".join(failures))
-
-        if progress_callback:
-            progress_callback("模型下载完成", 1.0, {"status": "completed"})
-
-    finally:
-        monitor.stop_monitoring()
+    # 使用引擎的运行时别名加载，避免下载器和引擎分别下载不同的模型集。
+    from engine import get_model
+    get_model(progress_callback)
 
 
 if __name__ == "__main__":

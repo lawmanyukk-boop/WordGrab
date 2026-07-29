@@ -67,7 +67,7 @@ TRASH = os.path.join(DATA, ".trash")
 INDEX_DB = os.path.join(DATA, "index.db")
 paths.configure_data_directory(DATA)
 store.configure_data_directory(DATA)
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 
 THEME_KEYS = {
     "aurora-sea", "solar-bloom", "lavender-haze", "tide-ember",
@@ -415,6 +415,8 @@ def migrate_data_directory(directory):
 
 def model_cache_dirs():
     roots = [
+        # ModelScope snapshot_download(cache_dir=~/.cache/modelscope) 的目录结构。
+        os.path.expanduser("~/.cache/modelscope/iic"),
         os.path.expanduser("~/.cache/modelscope/models/iic"),
         os.path.expanduser("~/.cache/modelscope/hub/models/iic"),
     ]
@@ -2033,11 +2035,6 @@ class Api:
     def start_model_download(self):
         """在后台下载必需语音模型；前端轮询状态，不从线程直接调用 WebView。"""
         global MODEL_DOWNLOAD_THREAD
-        info = self.get_system_info()
-        if info["model_ready"]:
-            with MODEL_DOWNLOAD_LOCK:
-                MODEL_DOWNLOAD.update(status="completed", progress=1, stage="语音模型已准备好", error="")
-            return self.get_model_download_status()
         if MODEL_DOWNLOAD_THREAD and MODEL_DOWNLOAD_THREAD.is_alive():
             return self.get_model_download_status()
 
@@ -2048,15 +2045,15 @@ class Api:
             with MODEL_DOWNLOAD_LOCK:
                 MODEL_DOWNLOAD.update(
                     status="downloading", stage=stage,
-                    progress=float(progress or 0), info=dict(details or {}), error="",
+                    progress=(float(progress) if progress is not None else None),
+                    info=dict(details or {}), error="",
                 )
 
         def download():
             try:
                 from model_downloader import download_models_with_progress
+                # get_model 成功返回才会走到这里；它比检查缓存目录可靠。
                 download_models_with_progress(update_progress)
-                if not self.get_system_info()["model_ready"]:
-                    raise RuntimeError("模型文件未完整下载，请重新尝试")
                 with MODEL_DOWNLOAD_LOCK:
                     MODEL_DOWNLOAD.update(status="completed", progress=1, stage="语音模型已准备好", error="")
             except Exception as exc:

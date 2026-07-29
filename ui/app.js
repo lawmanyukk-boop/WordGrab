@@ -1652,16 +1652,18 @@ function formatDownloadMeta(info={}){
     const progress=`${downloaded.toFixed(downloaded<10?1:0)} MB / ${total.toFixed(0)} MB`;
     return speed>.1?`${progress} · ${speed.toFixed(1)} MB/s`:progress;
   }
+  if(downloaded>0) return speed>.1?`本次已下载 ${downloaded.toFixed(0)} MB · ${speed.toFixed(1)} MB/s`:`本次已下载 ${downloaded.toFixed(0)} MB`;
   return info.current_model?`正在准备：${info.current_model}`:'正在准备下载…';
 }
 function updateOnboardingDownload(state={}){
-  const progress=Math.max(0,Math.min(1,Number(state.progress)||0));
-  $('#onboardingDownloadFill').style.width=`${Math.round(progress*100)}%`;
-  $('#onboardingDownloadPercent').textContent=`${Math.round(progress*100)}%`;
+  const hasProgress=state.progress!==null&&state.progress!==undefined&&Number.isFinite(Number(state.progress));
+  const progress=hasProgress?Math.max(0,Math.min(1,Number(state.progress))):0;
+  $('#onboardingDownloadFill').style.width=hasProgress?`${Math.round(progress*100)}%`:'32%';
+  $('#onboardingDownloadFill').classList.toggle('is-indeterminate',!hasProgress);
+  $('#onboardingDownloadPercent').textContent=hasProgress?`${Math.round(progress*100)}%`:'下载中';
   $('#onboardingDownloadStage').textContent=state.stage||'正在下载语音模型…';
   $('#onboardingDownloadMeta').textContent=formatDownloadMeta(state.info);
-  const speed=Number((state.info||{}).speed_mb_s)||0, total=Number((state.info||{}).total_mb)||0, downloaded=Number((state.info||{}).downloaded_mb)||0;
-  $('#onboardingDownloadEta').textContent=speed>.1&&total>downloaded?`约剩 ${Math.ceil((total-downloaded)/speed/60)} 分钟`:'';
+  $('#onboardingDownloadEta').textContent='';
   const failed=state.status==='error';
   $('#onboardingDownloadError').textContent=failed?(state.error||'下载没有完成，请检查网络后重试。'):'';
   $('#onboardingDownloadError').classList.toggle('hidden',!failed);
@@ -1684,10 +1686,10 @@ async function beginModelDownload(){
 async function initOnboarding(){
   if(!API.get_system_info) return;
   try{
-    const info=await API.get_system_info();
-    if(appSettings.onboarding_completed&&info.model_ready) return;
+    await API.get_system_info();
+    if(appSettings.onboarding_completed) return;
     setOnboardingVisible(true);
-    showOnboardingPage(info.model_ready?'done':'welcome');
+    showOnboardingPage('welcome');
   }catch(_){ }
 }
 
