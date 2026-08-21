@@ -12,12 +12,20 @@ let startTimer = 0;
 let appSettings = {};
 let skipSeconds = 15;
 let aiTemplates=[];
+let activeImportId='';
+let activeImportTitle='';
+let activeImportState=null;
+let mergeSpeakerSource='';
+let speakerContextIndex='';
+let microphoneMeterTimer=0;
+let microphoneMeterActive=false;
 
 const DEFAULT_APP_SETTINGS={
   theme:'aurora-sea',reopen_last:true,auto_open_import:true,default_speed:1,skip_seconds:15,
   auto_diarization:true,transcription_mode:'accuracy',export_format:'txt',export_directory:'',
   filename_rule:'source_date',font_size:'standard',list_density:'standard',appearance:'light',follow_system:false,
-  delete_audio_with_transcript:true,last_item_id:'',ai_base_url:'',ai_model:'',ai_summary_template:'general',ai_privacy_host:'',onboarding_completed:false
+  delete_audio_with_transcript:true,last_item_id:'',ai_base_url:'',ai_model:'',ai_summary_template:'general',ai_privacy_host:'',onboarding_completed:false,
+  preferred_mic_device:'',audio_enhancement:true,noise_reduction:false,recording_source:'microphone',transcription_provider:'funasr'
 };
 
 const THEMES=[
@@ -50,7 +58,7 @@ function speakerIndexes(record=cur){
 }
 function shouldShowSpeakerIdentity(record=cur){return Boolean(record&&speakerIndexes(record).length>0);}
 let toastTimer=0;
-function toast(msg,action){const t=$('#toast'),text=$('#toastText'),button=$('#toastAction');text.textContent=msg;button.classList.toggle('hidden',!action);button.onclick=async()=>{if(action)await action();t.classList.remove('show');};t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),action?5000:2200);}
+function toast(msg,action){const t=$('#toast'),text=$('#toastText'),button=$('#toastAction');text.textContent=msg;button.classList.toggle('hidden',!action);button.onclick=async()=>{if(!action)return;button.disabled=true;try{const followup=await action();t.classList.remove('show');if(followup)toast(followup);}finally{button.disabled=false;}};t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),action?5000:2200);}
 function setBanner(text){const b=$('#liveBanner');b.textContent=text||'';b.classList.toggle('hidden',!text);}
 function renderTranscriptKeepScroll(){
   const box=$('#transcript');
@@ -86,6 +94,7 @@ function setSettingsOpen(open){
     requestAnimationFrame(()=>$('.settings-nav-item.active').focus());
   }else{
     $('#confirmOverlay').classList.add('hidden');
+    stopMicrophoneMeter();
   }
 }
 
@@ -169,6 +178,93 @@ async function saveSetting(key,value){
   }catch(_){toast('设置暂时无法保存');}
 }
 
+function audioLevelPercent(value){
+  const rms=Math.max(1e-7,Number(value)||0);
+  const db=20*Math.log10(rms);
+  return Math.max(0,Math.min(100,(db+60)/50*100));
+}
+
+function renderMicrophoneLevel(status={}){
+  const rms=Number(status.rms)||0,peak=Number(status.peak)||0;
+  const level=audioLevelPercent(rms),peakLevel=audioLevelPercent(peak);
+  $('#microphoneMeterFill').style.width=`${level}%`;
+  $('#microphonePeak').style.left=`${peakLevel}%`;
+  const label=$('#microphoneLevelText');
+  if(status.error) label.textContent='无法读取：'+status.error;
+  else if(status.starting) label.textContent='正在连接麦克风…';
+  else if(!microphoneMeterActive) label.textContent='点击测试，然后说一句话';
+  else if(rms<0.0015) label.textContent='几乎没有声音，请检查设备或输入音量';
+  else if(rms<0.006) label.textContent='声音偏小，建议靠近麦克风';
+  else if(peak>0.92) label.textContent='声音过大，可能产生爆音';
+  else label.textContent='输入正常';
+}
+
+async function refreshAudioDevices(){
+  if(!API||!API.list_audio_input_devices)return;
+  const select=$('#microphoneSelect');
+  try{
+    const result=await API.list_audio_input_devices();
+    if(!result||!result.ok){$('#microphoneHint').textContent=result?.message||'无法读取麦克风';return;}
+    const current=appSettings.preferred_mic_device||'';
+    select.innerHTML='<option value="">系统默认麦克风</option>'+(result.devices||[]).map(device=>
+      `<option value="${escapeHtml(device.name)}">${escapeHtml(device.name)}${device.is_default?'（默认）':''}${device.is_bluetooth?' · 蓝牙':''}</option>`
+    ).join('');
+    select.value=(result.devices||[]).some(device=>device.name===current)?current:'';
+    if(current&&!select.value){
+      appSettings.preferred_mic_device='';
+      await saveSetting('preferred_mic_device','');
+      $('#microphoneHint').textContent='原麦克风已断开，录音时将使用系统默认设备';
+    }else $('#microphoneHint').textContent=(result.devices||[]).length?`检测到 ${(result.devices||[]).length} 个输入设备`:'没有检测到麦克风';
+  }catch(error){$('#microphoneHint').textContent='无法读取麦克风：'+error;}
+  refreshSystemAudioSupport();
+}
+
+async function refreshSystemAudioSupport(){
+  if(!API?.get_system_audio_support)return;
+  try{
+    const support=await API.get_system_audio_support();
+    const select=$('#recordingSourceSelect');
+    Array.from(select.options).forEach(option=>{
+      if(option.value!=='microphone')option.disabled=!support.supported;
+    });
+    $('#systemAudioHint').textContent=support.supported
+      ?'电脑声音可用；首次使用会请求屏幕录制权限'
+      :(support.message||'电脑声音不可用，仍可正常录制麦克风');
+    if(!support.supported&&appSettings.recording_source!=='microphone'){
+      await saveSetting('recording_source','microphone');
+    }
+  }catch(_){$('#systemAudioHint').textContent='无法检查电脑声音组件';}
+}
+
+async function pollMicrophoneMeter(){
+  if(!microphoneMeterActive||!API?.audio_level_monitor_status)return;
+  try{renderMicrophoneLevel(await API.audio_level_monitor_status());}catch(_){ }
+}
+
+async function startMicrophoneMeter(){
+  if(!API?.start_audio_level_monitor)return;
+  const button=$('#testMicrophoneBtn');button.disabled=true;button.textContent='连接中…';
+  try{
+    const result=await API.start_audio_level_monitor($('#microphoneSelect').value||'');
+    if(!result?.ok){toast(result?.message||'无法测试麦克风');return;}
+    microphoneMeterActive=true;button.textContent='停止';button.disabled=false;
+    renderMicrophoneLevel(result);
+    clearInterval(microphoneMeterTimer);microphoneMeterTimer=setInterval(pollMicrophoneMeter,140);pollMicrophoneMeter();
+  }catch(error){toast('无法测试麦克风：'+error);}
+  finally{if(!microphoneMeterActive){button.disabled=false;button.textContent='测试';}}
+}
+
+async function stopMicrophoneMeter(){
+  microphoneMeterActive=false;clearInterval(microphoneMeterTimer);microphoneMeterTimer=0;
+  const button=$('#testMicrophoneBtn');if(button){button.disabled=false;button.textContent='测试';}
+  if(API?.stop_audio_level_monitor){try{await API.stop_audio_level_monitor();}catch(_){ }}
+  if($('#microphoneMeterFill'))renderMicrophoneLevel({});
+}
+
+async function toggleMicrophoneMeter(){
+  if(microphoneMeterActive) await stopMicrophoneMeter(); else await startMicrophoneMeter();
+}
+
 function showSettingsPage(page){
   document.querySelectorAll('.settings-page').forEach(section=>section.classList.toggle('active',section.dataset.settingsContent===page));
   const navPage=page==='themes'?'appearance':page;
@@ -177,6 +273,7 @@ function showSettingsPage(page){
   $('#settingsTitle').textContent=title;
   $('#settingsSubtitle').textContent=subtitle;
   $('.settings-scroll').scrollTop=0;
+  if(page==='transcription') refreshAudioDevices();
 }
 
 async function refreshSystemInfo(){
@@ -208,6 +305,13 @@ function confirmSettingsAction(title,message,confirmLabel='确认'){
   });
 }
 
+function setAiConnectionStatus(message,state='neutral'){
+  const status=$('#aiConnectionStatus');
+  if(!status)return;
+  status.textContent=message;
+  status.dataset.state=state;
+}
+
 async function loadAiSettings(){
   if(!API||!API.get_ai_settings)return;
   try{
@@ -218,8 +322,8 @@ async function loadAiSettings(){
     setTemplateSelectValue(values.summary_template||'general');
     $('#aiApiKey').value='';
     $('#aiKeyHint').textContent=values.key_configured?`已保存 Key · 尾号 ${values.key_last4}`:'仅保存在本机，不会上传或写入项目';
-    $('#aiConnectionStatus').textContent=values.key_configured&&values.base_url&&values.model?'配置已保存':'尚未完成配置';
-  }catch(_){$('#aiConnectionStatus').textContent='暂时无法读取 AI 设置';}
+    setAiConnectionStatus(values.key_configured&&values.base_url&&values.model?'配置已保存':'尚未完成配置');
+  }catch(_){setAiConnectionStatus('暂时无法读取 AI 设置','error');}
 }
 
 function renderTemplateSelects(selected){
@@ -324,6 +428,13 @@ async function initSettingsCenter(){
       saveSetting(key,value);
     };
   });
+  $('#testMicrophoneBtn').onclick=toggleMicrophoneMeter;
+  $('#microphoneSelect').onchange=async()=>{
+    if(microphoneMeterActive)await stopMicrophoneMeter();
+    await saveSetting('preferred_mic_device',$('#microphoneSelect').value||'');
+    const option=$('#microphoneSelect').selectedOptions[0];
+    if(option&&option.textContent.includes('蓝牙')) toast('蓝牙麦克风可能降低录音质量，建议优先使用 Mac 内置麦克风');
+  };
   document.querySelectorAll('[data-appearance-option]').forEach(button=>{
     button.onclick=()=>saveSetting('appearance',button.dataset.appearanceOption);
   });
@@ -388,7 +499,7 @@ async function initSettingsCenter(){
       if(!result||!result.ok){toast(result&&result.message||'无法获取模型');return;}
       const list=$('#aiModelList');list.innerHTML='';
       (result.models||[]).forEach(model=>{const option=document.createElement('option');option.value=model;list.appendChild(option);});
-      $('#aiConnectionStatus').textContent=`已读取 ${result.models.length} 个模型`;
+      setAiConnectionStatus(`已读取 ${result.models.length} 个模型`,'success');
       if(!$('#aiModel').value&&result.models.length)$('#aiModel').value=result.models[0];
       renderModelChips(result.models||[]);
     }catch(_){toast('无法获取模型');}
@@ -396,12 +507,12 @@ async function initSettingsCenter(){
   };
   $('#aiModel').addEventListener('input',highlightSelectedModelChip);
   $('#testAiConnection').onclick=async()=>{
-    const button=$('#testAiConnection');button.disabled=true;button.textContent='测试中…';$('#aiConnectionStatus').textContent='正在连接 AI 服务…';
+    const button=$('#testAiConnection');button.disabled=true;button.textContent='测试中…';setAiConnectionStatus('正在连接 AI 服务…','loading');
     try{
       const result=await API.test_ai_connection(aiFormValues());
-      if(result&&result.ok){$('#aiConnectionStatus').textContent=`连接成功 · ${result.model} · ${result.elapsed}秒`;toast('AI 服务连接成功');}
-      else{$('#aiConnectionStatus').textContent=result&&result.message||'连接失败';toast(result&&result.message||'连接失败');}
-    }catch(_){$('#aiConnectionStatus').textContent='连接失败';toast('无法连接 AI 服务');}
+      if(result&&result.ok)setAiConnectionStatus(`连接成功 · ${result.model} · ${result.elapsed}秒`,'success');
+      else setAiConnectionStatus(result&&result.message||'连接失败','error');
+    }catch(_){setAiConnectionStatus('无法连接 AI 服务','error');}
     finally{button.disabled=false;button.textContent='测试连接';}
   };
   document.addEventListener('keydown',event=>{
@@ -415,6 +526,19 @@ async function loadHistory(){
   if(window.historySortOldest) items.reverse();
   window.historyItems=items;
   renderHistory(items);
+  const processing=items.find(item=>item.processing_active);
+  if(processing&&!activeImportId){
+    activeImportId=processing.id;activeImportTitle=processing.title||'音频';
+    activeImportState={status:processing.status,stage:processing.status==='queued'?'排队中…':'正在后台转写…',title:activeImportTitle,info:{elapsed_seconds:0}};
+    progT0=Date.now();updateBackgroundImportBar(activeImportState);pollStatus(processing.id);
+  }
+}
+function historyStatusLabel(item){
+  if(item.status==='error')return '失败';
+  if(item.status==='queued')return '排队中';
+  if(item.status==='running')return '处理中';
+  if(item.status==='draft')return '初稿就绪';
+  return item.created||'';
 }
 function renderHistory(items){
   const q = $('#sideSearch').value.trim();
@@ -428,8 +552,16 @@ function renderHistory(items){
     el.title=x.title||'';
     el.innerHTML=`${window.historyManageMode?`<input class="hist-check" type="checkbox" data-id="${x.id}" aria-label="选择${escapeHtml(x.title)}">`:''}<span class="hist-index">${String(index+1).padStart(2,'0')}</span>
       <span class="hist-copy"><span class="t">${escapeHtml(x.title)}</span>
-      <span class="m"><span title="${escapeHtml(x.error||'')}">${x.status==='error'?'失败':x.status==='running'?'处理中':x.created||''}</span><span>${fmt(x.duration)}</span><span>${x.n_speakers}人</span></span></span>`;
-    el.onclick=event=>{if(event.target.closest('.hist-check'))return;if(window.historyManageMode)return;openItem(x.id);};
+      <span class="m"><span title="${escapeHtml(x.error||'')}">${historyStatusLabel(x)}</span><span>${fmt(x.duration)}</span><span>${x.n_speakers}人</span></span></span>`;
+    el.onclick=event=>{
+      if(event.target.closest('.hist-check')||window.historyManageMode)return;
+      if(['queued','running'].includes(x.status)){
+        if(activeImportId===x.id){showProgress(activeImportTitle||x.title);if(activeImportState)applyProgress(activeImportState);}
+        else toast('这份音频正在后台转写，初稿完成后即可打开');
+        return;
+      }
+      openItem(x.id);
+    };
     el.oncontextmenu=async event=>{
       event.preventDefault();event.stopPropagation();
       if(window.historyManageMode)return;
@@ -524,6 +656,7 @@ $('#historyContextMenu').addEventListener('click',async event=>{
 
 /* ---------- 打开一条 ---------- */
 async function openItem(id, keepScroll){
+  backgroundActiveImport(false);
   leaveLiveRecordingUI();
   const sameItem = cur && cur.id === id && !cur.live;
   const opened = await API.open_item(id);
@@ -543,7 +676,7 @@ async function openItem(id, keepScroll){
   $('#docMeta').textContent = cur.spk_pending
     ? `${fmt(cur.duration)} · 初稿`
     : participantCount>0?`${fmt(cur.duration)} · ${participantCount}位说话人`:`${fmt(cur.duration)} · 录音文稿`;
-  $('#docStatus').textContent=cur.spk_pending?'处理中':'已完成';
+  $('#docStatus').textContent=cur.spk_pending?(cur.processing_active?'处理中':'初稿'):'已完成';
   $('#fileFormat').textContent=cur.audio_format||'音频';
   $('#fileDuration').textContent=fmt(cur.duration);
   if(!sameItem){
@@ -557,11 +690,13 @@ async function openItem(id, keepScroll){
   if(keepScroll) renderTranscriptKeepScroll(); else renderTranscript();
   renderSpkBar();
   if(cur.spk_pending){
-    setBanner(appSettings.auto_diarization
-      ? '说话人分离进行中…文稿已可阅读，说话人稍后自动标注'
-      : '精细校对进行中…文稿已可阅读，完成后自动更新');
+    setBanner(cur.processing_active
+      ? (appSettings.auto_diarization
+        ? '说话人分离正在后台进行…文稿已可阅读，说话人稍后自动标注'
+        : '精细校对正在后台进行…文稿已可阅读，完成后自动更新')
+      : '这份初稿的后续处理已中断，当前内容仍可阅读或导出');
     const retry=document.createElement('button'); retry.type='button'; retry.className='retry-btn'; retry.textContent='仅重新分离说话人';
-    retry.onclick=async()=>{retry.disabled=true;const result=await API.retry_diarization(cur.id);if(result&&result.ok){showProgress(cur.title);pollStatus(cur.id);}else{retry.disabled=false;toast(result&&result.message||'无法重新分离');}};
+    retry.onclick=async()=>{retry.disabled=true;const id=cur.id,title=cur.title;const result=await API.retry_diarization(id);if(result&&result.ok){activeImportId=id;activeImportTitle=title;activeImportState={status:'running',stage:'准备重新进行说话人分离…',title,info:{elapsed_seconds:0}};showProgress(title);applyProgress(activeImportState);pollStatus(id);}else{retry.disabled=false;toast(result&&result.message||'无法重新分离');}};
     $('#liveBanner').append(' ',retry);
   }else{
     setBanner('');
@@ -585,6 +720,7 @@ function renderSpkBar(){
     chip.className='spk-chip'; chip.style.background=spkColor(i); chip.dataset.spk=i;
     chip.title='双击改名（该说话人全部记录都会改）';
     chip.textContent=spkName(i).slice(-2);
+    chip.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();openSpeakerContextMenu(i,event.clientX,event.clientY);};
     chip.ondblclick=()=>{
       const name=list&&list.querySelector(`.speaker-row-name[data-spk="${i}"]`);
       if(name)beginInlineSpeakerRename(i,name);
@@ -595,14 +731,107 @@ function renderSpkBar(){
       const row=document.createElement('div');
       row.className='speaker-row';row.tabIndex=0;row.setAttribute('role','group');
       row.innerHTML=`<span class="speaker-row-avatar" style="background:${spkColor(i)}">${escapeHtml(spkName(i).slice(-1))}</span>
-        <span class="speaker-row-copy"><strong class="speaker-row-name" data-spk="${i}" title="双击改名">${escapeHtml(spkName(i))}</strong><small>说话人 ${i+1} · 双击改名</small></span>`;
+        <span class="speaker-row-copy"><strong class="speaker-row-name" data-spk="${i}" title="双击改名">${escapeHtml(spkName(i))}</strong><small>说话人 ${i+1} · 双击改名</small></span>
+        <button class="speaker-merge-btn" type="button" data-spk="${i}" title="合并到其他说话人" aria-label="合并${escapeHtml(spkName(i))}">合并</button>`;
       const name=row.querySelector('.speaker-row-name');
       name.ondblclick=event=>{event.stopPropagation();beginInlineSpeakerRename(i,name);};
-      row.onkeydown=event=>{if((event.key==='Enter'||event.key==='F2')&&!name.isContentEditable){event.preventDefault();beginInlineSpeakerRename(i,name);}};
+      const merge=row.querySelector('.speaker-merge-btn');
+      merge.onclick=event=>{event.stopPropagation();openSpeakerMerge(i);};
+      row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();openSpeakerContextMenu(i,event.clientX,event.clientY);};
+      row.onkeydown=event=>{
+        if((event.shiftKey&&event.key==='F10')||event.key==='ContextMenu'){
+          event.preventDefault();const rect=row.getBoundingClientRect();openSpeakerContextMenu(i,rect.right-18,rect.top+18);return;
+        }
+        if((event.key==='Enter'||event.key==='F2')&&!name.isContentEditable){event.preventDefault();beginInlineSpeakerRename(i,name);}
+      };
       list.appendChild(row);
     }
   });
 }
+
+function speakerSegmentCount(index){
+  return ((cur&&cur.segments)||[]).filter(segment=>Number(segment.spk||0)===Number(index)).length;
+}
+function updateSpeakerMergeMessage(){
+  const target=$('#speakerMergeTarget');
+  const targetIndex=target&&target.value;
+  if(!mergeSpeakerSource||!targetIndex||!cur)return;
+  $('#speakerMergeMessage').textContent=`将“${spkName(Number(mergeSpeakerSource))}”的 ${speakerSegmentCount(mergeSpeakerSource)} 段发言合并到“${spkName(Number(targetIndex))}”吗？合并后可以撤销。`;
+}
+function closeSpeakerMerge(){
+  $('#speakerMergeOverlay').classList.add('hidden');
+  mergeSpeakerSource='';
+}
+function openSpeakerMerge(source){
+  if(!cur||cur.live||cur.processing_active)return toast('文稿处理完成后才能合并说话人');
+  const indexes=speakerIndexes(cur).filter(index=>index!==Number(source));
+  if(!indexes.length)return toast('至少需要两个说话人才能合并');
+  mergeSpeakerSource=String(source);
+  const target=$('#speakerMergeTarget');
+  target.innerHTML=indexes.map(index=>`<option value="${index}">${escapeHtml(spkName(index))} · ${speakerSegmentCount(index)} 段</option>`).join('');
+  updateSpeakerMergeMessage();
+  $('#speakerMergeOverlay').classList.remove('hidden');
+  requestAnimationFrame(()=>target.focus());
+}
+$('#speakerMergeTarget').onchange=updateSpeakerMergeMessage;
+$('#speakerMergeCancel').onclick=closeSpeakerMerge;
+$('#speakerMergeAccept').onclick=async()=>{
+  if(!cur||!mergeSpeakerSource)return;
+  const id=cur.id,source=mergeSpeakerSource,target=$('#speakerMergeTarget').value;
+  if(!target||source===target)return;
+  const button=$('#speakerMergeAccept');button.disabled=true;
+  try{
+    const result=await API.merge_speakers(id,source,target);
+    if(!result||!result.ok){toast(result&&result.message||'合并失败');return;}
+    closeSpeakerMerge();
+    await openItem(id,true);
+    toast(`已合并 ${result.moved_segments||0} 段发言`,async()=>{
+      const undone=await API.undo_speaker_edit(id);
+      if(undone&&undone.ok){await openItem(id,true);return '已撤销说话人合并';}
+      return undone&&undone.message||'撤销失败';
+    });
+  }catch(_){toast('合并失败');}
+  finally{button.disabled=false;}
+};
+
+function closeSpeakerContextMenu(){
+  const menu=$('#speakerContextMenu');if(!menu)return;
+  menu.classList.add('hidden');speakerContextIndex='';
+}
+function openSpeakerContextMenu(index,x,y){
+  if(!cur||cur.live||cur.processing_active)return toast('文稿处理完成后才能删除说话人');
+  if(speakerIndexes(cur).length<=1)return toast('文稿中至少保留一位说话人');
+  const menu=$('#speakerContextMenu');if(!menu)return;
+  closeHistoryContextMenu();speakerContextIndex=String(index);menu.classList.remove('hidden');
+  menu.style.left='0px';menu.style.top='0px';
+  const width=menu.offsetWidth,height=menu.offsetHeight,pad=8;
+  menu.style.left=`${Math.max(pad,Math.min(x,window.innerWidth-width-pad))}px`;
+  menu.style.top=`${Math.max(pad,Math.min(y,window.innerHeight-height-pad))}px`;
+  requestAnimationFrame(()=>menu.querySelector('button')?.focus({preventScroll:true}));
+}
+$('#speakerContextMenu').addEventListener('click',async event=>{
+  const button=event.target.closest('[data-speaker-context-action]');if(!button||!cur||speakerContextIndex==='')return;
+  event.stopPropagation();
+  const id=cur.id,source=speakerContextIndex,name=spkName(Number(source)),count=speakerSegmentCount(source);
+  closeSpeakerContextMenu();
+  if(!count)return toast('没有找到需要删除的文稿段落');
+  const confirmed=await confirmSettingsAction(
+    '删除说话人',
+    `删除“${name}”后，其 ${count} 段文稿将从当前文稿、导出和 AI 总结中移除。原始音频不会改变。`,
+    '删除',
+  );
+  if(!confirmed)return;
+  try{
+    const result=await API.delete_speaker(id,source);
+    if(!result||!result.ok){toast(result&&result.message||'删除失败');return;}
+    await openItem(id,true);
+    toast(`已删除“${name}”的 ${count} 段文稿`,async()=>{
+      const undone=await API.undo_speaker_edit(id);
+      if(undone&&undone.ok){await openItem(id,true);return '已撤销说话人删除';}
+      return undone&&undone.message||'撤销失败';
+    });
+  }catch(_){toast('删除说话人失败');}
+});
 
 function beginInlineSpeakerRename(i,element){
   if(!cur||cur.live||!element)return;
@@ -830,6 +1059,7 @@ speedMenu.onkeydown=event=>{
 };
 document.addEventListener('click',event=>{
   if(!event.target.closest('#historyContextMenu'))closeHistoryContextMenu();
+  if(!event.target.closest('#speakerContextMenu'))closeSpeakerContextMenu();
   if(!speedMenu.classList.contains('hidden')&&!event.target.closest('#speedControl')) setSpeedMenuOpen(false);
   if(!volumePanel.classList.contains('hidden')&&!event.target.closest('#volumeControl')) setVolumePanelOpen(false);
   if(!$('#exportMenu').classList.contains('hidden')&&!event.target.closest('#exportControl')) setExportMenuOpen(false);
@@ -837,6 +1067,8 @@ document.addEventListener('click',event=>{
 document.addEventListener('keydown',event=>{
   if(event.key==='Escape'){
     if(!$('#historyContextMenu').classList.contains('hidden')){closeHistoryContextMenu();return;}
+    if(!$('#speakerContextMenu').classList.contains('hidden')){closeSpeakerContextMenu();return;}
+    if(!$('#speakerMergeOverlay').classList.contains('hidden')){closeSpeakerMerge();return;}
     if(!$('#confirmOverlay').classList.contains('hidden')){$('#confirmCancel').click();return;}
     if(!speedMenu.classList.contains('hidden')){setSpeedMenuOpen(false);speedBtn.focus();}
     if(!volumePanel.classList.contains('hidden')){setVolumePanelOpen(false);volumeBtn.focus();}
@@ -1130,7 +1362,12 @@ async function doImport(){
     await API.log('pick_file 返回: '+path);
     if(!path){ toast('未选择文件'); return; }
     const id = await API.start_transcribe(path);
-    showProgress(path.split('/').pop());
+    activeImportId=id;
+    activeImportTitle=path.split('/').pop();
+    activeImportState={status:'running',stage:'正在复制音频…',title:activeImportTitle,info:{elapsed_seconds:0}};
+    await loadHistory();
+    showProgress(activeImportTitle);
+    applyProgress(activeImportState);
     pollStatus(id);
   }catch(e){
     await API.log('doImport 出错: '+e);
@@ -1161,8 +1398,8 @@ function setLiveCaption(state={}){
   const modelStatus=state.model_status||'ready';
   const modelPreparing=modelStatus==='preparing';
   const modelFailed=modelStatus==='error';
-  const labels={preparing:'正在准备',recording:'正在听',paused:'已暂停',stopping:'正在保存',finalizing:'正在生成文稿'};
-  caption.classList.remove('is-preparing','is-paused','is-stopping','is-finalizing');
+  const labels={preparing:'正在准备',recording:'正在听',paused:'已暂停',stopping:'正在保存',draining:'正在排空',finalizing:'正在生成文稿'};
+  caption.classList.remove('is-preparing','is-paused','is-stopping','is-draining','is-finalizing');
   if(status!=='recording')caption.classList.add('is-'+status);
   if(modelPreparing)caption.classList.add('is-preparing');
   const text=(state.caption_text||'').trim();
@@ -1172,6 +1409,7 @@ function setLiveCaption(state={}){
   const displayLag=Math.max(lag,queueLag);
   let lagText='字幕同步';
   if(status==='finalizing')lagText='实时字幕已归档';
+  else if(status==='draining')lagText='正在补齐尾部实时字幕';
   else if(status==='stopping')lagText='正在处理剩余音频';
   else if(modelPreparing)lagText='字幕模型准备中';
   else if(modelFailed)lagText='实时字幕不可用';
@@ -1185,8 +1423,11 @@ function setLiveCaption(state={}){
       :status==='recording'&&(state.live_degraded||displayLag>4)
         ?'正在追赶':labels[status]||'正在听';
   $('#liveCaptionLag').textContent=lagText;
+  const inputLevel=Number(state.input_level||state.input_rms)||0;
+  $('#liveInputMeterFill').style.width=`${audioLevelPercent(inputLevel)}%`;
   $('#liveCaptionText').textContent=text||(
     status==='stopping'?'正在安全保存录音…'
+      :status==='draining'?'录音已经保存，正在处理最后一句话…'
       :status==='finalizing'?'录音已结束，正在生成正式文稿…'
       :modelPreparing
       ?(status==='paused'
@@ -1234,9 +1475,9 @@ function updateBackgroundRecordingBar(state){
   bar.classList.toggle('hidden',!show);
   if(!show)return;
   bar.classList.toggle('is-paused',status==='paused');
-  bar.classList.toggle('is-processing',['stopping','finalizing'].includes(status));
+  bar.classList.toggle('is-processing',['stopping','draining','finalizing'].includes(status));
   const labels={
-    recording:'正在录音',paused:'录音已暂停',stopping:'正在保存录音',finalizing:'最终文稿处理中'
+    recording:'正在录音',paused:'录音已暂停',stopping:'正在保存录音',draining:'正在补齐字幕',finalizing:'最终文稿处理中'
   };
   $('#backgroundRecordingLabel').textContent=labels[status]||'录音任务';
   $('#backgroundRecordingTime').textContent=fmt(state.duration||0);
@@ -1269,7 +1510,7 @@ async function pollLiveRecording(){
       $('#docTitle').textContent=state.title||'实时录音';
       $('#docEyebrow').textContent='实时录音 · '+fmt(state.duration);
       $('#docMeta').textContent=state.stage||'正在录音…';
-      $('#docStatus').textContent=state.status==='paused'?'已暂停':state.status==='stopping'?'正在保存':'录音中';
+      $('#docStatus').textContent=state.status==='paused'?'已暂停':state.status==='stopping'?'正在保存':state.status==='draining'?'正在补齐字幕':'录音中';
       cur.duration=Number(state.duration)||0;
       const previousModelStatus=cur.model_status;
       cur.model_status=state.model_status||cur.model_status||'preparing';
@@ -1280,7 +1521,9 @@ async function pollLiveRecording(){
         renderTranscriptKeepScroll();renderSpkBar();
       }
       setLiveCaption(state);
-      if(state.error||state.warning)setBanner(state.error||state.warning);else setBanner('');
+      if(state.error||state.warning||state.quality_warning){
+        setBanner(state.error||state.warning||state.quality_warning);
+      }else setBanner('');
     }else{
       leaveLiveRecordingUI();
     }
@@ -1315,6 +1558,7 @@ $('#backgroundRecordingBar').onclick=async()=>{
 };
 $('#recordBtn').onclick=async()=>{
   try{
+    await stopMicrophoneMeter();
     setRecordingControls('starting');
     const result=await API.start_recording();
     if(!result||result.ok===false){setRecordingControls('done');toast(result&&result.message||'无法开始录音');return;}
@@ -1365,7 +1609,9 @@ function showProgress(name){
   $('#progress').classList.remove('hidden');
   $('#progTitle').textContent='正在转写：'+name;
   $('#progFill').classList.add('indet');$('#progFill').style.width='';
-  progT0=Date.now(); progEst=0; progDur=0; clearInterval(startTimer);
+  const knownElapsed=Number(activeImportState?.info?.elapsed_seconds)||0;
+  progT0=Date.now()-knownElapsed*1000; progEst=Number(activeImportState?.info?.est_total)||0; progDur=Number(activeImportState?.info?.duration)||0; clearInterval(startTimer);
+  $('#backgroundImportBar').classList.add('hidden');
   startTimer=setInterval(tickProgress,500);
 }
 function tickProgress(){
@@ -1380,18 +1626,52 @@ function tickProgress(){
     if(progDur>0) line+='（音频 '+fmt(progDur)+'）';
   }
   $('#progElapsed').textContent=line;
+  updateBackgroundImportBar(activeImportState,el);
+}
+function updateBackgroundImportBar(state=activeImportState,elapsedOverride){
+  const bar=$('#backgroundImportBar');
+  if(!bar)return;
+  const active=Boolean(activeImportId&&state&&!['done','error'].includes(state.status));
+  const show=active&&$('#progress').classList.contains('hidden');
+  bar.classList.toggle('hidden',!show);
+  if(!show)return;
+  const info=state.info||{};
+  const elapsed=Number.isFinite(elapsedOverride)?elapsedOverride:Number(info.elapsed_seconds)||Math.max(0,(Date.now()-progT0)/1000);
+  const eta=Number(info.eta_seconds);
+  $('#backgroundImportTitle').textContent=activeImportTitle||state.title||'后台转写';
+  $('#backgroundImportStage').textContent=state.stage||'正在本机处理音频…';
+  $('#backgroundImportElapsed').textContent=`已用 ${fmt(elapsed)}`;
+  $('#backgroundImportEta').textContent=Number.isFinite(eta)&&eta>0?`约剩 ${fmt(eta)}`:'';
+}
+function backgroundActiveImport(restore=true){
+  if(!activeImportId)return;
+  $('#progress').classList.add('hidden');
+  if(restore)restoreAfterBackgroundImport();
+  updateBackgroundImportBar();
+}
+function finishActiveImport(){
+  activeImportId='';activeImportTitle='';activeImportState=null;
+  $('#backgroundImportBar').classList.add('hidden');
 }
 /* 进度：前端轮询后端 /status/<iid>（后台线程只写状态，不从子线程回调 JS，避免 macOS 崩溃）*/
 let pollTimer=0;
 function applyProgress(p){
+  activeImportState=p;
+  if(p.title)activeImportTitle=p.title;
+  const backendElapsed=Number(p.info?.elapsed_seconds);
+  if(Number.isFinite(backendElapsed))progT0=Date.now()-backendElapsed*1000;
   $('#progStage').textContent=p.stage||'';
   if(p.info){ if(p.info.est_total) progEst=p.info.est_total; if(p.info.duration) progDur=p.info.duration; }
+  updateBackgroundImportBar(p);
   if(progEst>0){ tickProgress(); return; } // 进度条改由 tickProgress 按预估时间驱动
   const fill=$('#progFill');
   if(p.pct==null){fill.classList.add('indet');fill.style.width='';}
   else{fill.classList.remove('indet');fill.style.width=Math.round(p.pct*100)+'%';}
 }
 function stopProgress(){ clearInterval(pollTimer); clearInterval(startTimer); }
+
+$('#progressBackground').onclick=()=>{backgroundActiveImport(true);toast('转写已转入后台，你可以继续查看其他文稿');};
+$('#backgroundImportBar').onclick=()=>{if(!activeImportId)return;showProgress(activeImportTitle||'音频');if(activeImportState)applyProgress(activeImportState);};
 
 /* 渐进出字：转写中就把已识别的段落实时铺到文稿区 */
 function renderLive(iid, st){
@@ -1427,6 +1707,7 @@ function restoreAfterBackgroundImport(){
 }
 
 function pollStatus(iid){
+  activeImportId=iid;
   clearInterval(pollTimer);
   let draftOpened=false;
   pollTimer=setInterval(async()=>{
@@ -1447,6 +1728,7 @@ function pollStatus(iid){
         await loadHistory();
         if(viewing) await openItem(iid, true);
         else{restoreAfterBackgroundImport();toast('文稿已就绪，正在后台完成处理');}
+        updateBackgroundImportBar(st);
       }
     }else if(st.status==='done'){
       stopProgress();
@@ -1454,6 +1736,8 @@ function pollStatus(iid){
       await loadHistory();
       if(viewing){ await openItem(iid, true); }
       else restoreAfterBackgroundImport();
+      finishActiveImport();
+      await loadHistory();
       toast('转写完成');
     }else if(st.status==='error'){
       stopProgress();
@@ -1463,10 +1747,12 @@ function pollStatus(iid){
       }else if(viewing && !(cur&&cur.live)){
         $('#empty').classList.remove('hidden');
       }else restoreAfterBackgroundImport();
+      finishActiveImport();
+      await loadHistory();
       if(viewing){
         setBanner('转写失败：'+(st.msg||'未知'));
         const retry=document.createElement('button'); retry.type='button'; retry.className='retry-btn'; retry.textContent='重新处理';
-        retry.onclick=async()=>{retry.disabled=true;retry.textContent='准备中…';const result=await API.retry_item(iid);if(result&&result.ok){showProgress(st.title||'音频');pollStatus(iid);}else{retry.disabled=false;retry.textContent='重新处理';toast(result&&result.message||'无法重新处理');}};
+        retry.onclick=async()=>{retry.disabled=true;retry.textContent='准备中…';const title=st.title||'音频';const result=await API.retry_item(iid);if(result&&result.ok){activeImportId=iid;activeImportTitle=title;activeImportState={status:'running',stage:'准备重试…',title,info:{elapsed_seconds:0}};showProgress(title);applyProgress(activeImportState);pollStatus(iid);}else{retry.disabled=false;retry.textContent='重新处理';toast(result&&result.message||'无法重新处理');}};
         $('#liveBanner').append(' ',retry);
       }
       toast('出错：'+(st.msg||'未知'));
@@ -1489,15 +1775,21 @@ function initDrop(){
     if(!f){ toast('没读到文件'); return; }
     if(!DROP_OK.test(f.name)){ toast('不支持的文件类型：'+f.name); return; }
     if(f.size>2*1024*1024*1024){ toast('文件过大，单个文件不能超过 2GB'); return; }
-    showProgress(f.name);
+    activeImportId='uploading';activeImportTitle=f.name;
+    activeImportState={status:'running',stage:'正在导入音频…',title:f.name,info:{elapsed_seconds:0}};
+    showProgress(f.name);applyProgress(activeImportState);
     try{
       const resp = await fetch('/upload?name='+encodeURIComponent(f.name),{method:'POST',body:f});
       if(!resp.ok) throw new Error('HTTP '+resp.status);
       const j = await resp.json();
+      activeImportId=j.id;activeImportTitle=f.name;
+      activeImportState={status:'running',stage:'正在准备音频…',title:f.name,info:{elapsed_seconds:0}};
+      await loadHistory();applyProgress(activeImportState);
       pollStatus(j.id); // 转写进度由前端轮询 /status
     }catch(err){
       stopProgress();
       $('#progress').classList.add('hidden'); $('#empty').classList.remove('hidden');
+      finishActiveImport();
       toast('上传失败：'+err);
     }
   });
@@ -1505,7 +1797,8 @@ function initDrop(){
 
 /* ---------- 浏览器预览数据（只在 ?preview=1 时启用） ---------- */
 function createPreviewApi(){
-  let previewSettings={...DEFAULT_APP_SETTINGS,theme:'solar-bloom',export_directory:'~/Documents'};
+  const previewBackgroundTask=new URLSearchParams(location.search).get('background')==='1';
+  let previewSettings={...DEFAULT_APP_SETTINGS,theme:'solar-bloom',export_directory:'~/Documents',onboarding_completed:previewBackgroundTask};
   let previewDataPath='~/Library/Application Support/WordGrab/data';
   let items=[
     {id:'demo-1',title:'推广管培生招聘需求会',duration:596,created:'2026-07-15 11:57',n_speakers:2},
@@ -1514,6 +1807,9 @@ function createPreviewApi(){
     {id:'demo-4',title:'法务岗位复试',duration:3761,created:'2026-07-05 18:52',n_speakers:3},
     {id:'demo-5',title:'一道通背调',duration:520,created:'2026-07-03 20:31',n_speakers:3},
   ];
+  if(previewBackgroundTask){
+    items.unshift({id:'preview-import',title:'市场访谈.m4a',duration:1190,created:'处理中',n_speakers:0,status:'running',processing_active:true});
+  }
   const sample={
     id:'demo-1',title:'推广管培生招聘需求会',duration:596,created:'2026-07-15 11:57',audio_format:'M4A',audio_url:'',spk_pending:false,
     speakers:{'0':'林言','1':'陈屿'},
@@ -1524,7 +1820,7 @@ function createPreviewApi(){
       {spk:1,start:134000,text:'可以。学历不是唯一判断标准，我们会更关注实习经历中真正做过什么，以及遇到困难时怎么推进。'},
     ],
   };
-  let previewSummary=null;
+  let previewSummary=null,previewSpeakerBackup=null;
   let previewTemplates=[{id:'general',name:'通用摘要',builtin:true,objective:'完整分析录音内容',focus:['内容概述','关键结论'],detail:'standard'}];
   let previewRecording=null,previewCaptionStep=0,previewPrepareStep=0;
   const previewCaptions=[
@@ -1534,12 +1830,45 @@ function createPreviewApi(){
   ];
   return {
     async list_items(){return items;},
+    async list_audio_input_devices(){return {ok:true,default_device:0,devices:[{id:0,name:'MacBook Pro 麦克风',sample_rate:48000,channels:1,is_default:true},{id:1,name:'外接 USB 麦克风',sample_rate:48000,channels:1,is_default:false}]};},
+    async get_system_audio_support(){return {supported:true,available:true,reason:'',os_version:'14.5'};},
+    async start_input_level_monitor(){return {ok:true};},
+    async input_level_status(){return {ok:true,rms:0.026,peak:0.11,level:0.43,device_name:'MacBook Pro 麦克风'};},
+    async stop_input_level_monitor(){return {ok:true};},
+    async list_transcription_providers(){return [{id:'funasr',name:'FunASR 本地模型',available:true,capabilities:{live:true,final:true,diarization:true,offline:true}}];},
     async open_item(id){
       const base={...sample,id,title:(items.find(x=>x.id===id)||items[0]).title};
       if(id==='demo-5')return {...base,speakers:{'0':'说话人1'},segments:sample.segments.map(segment=>({...segment,spk:0}))};
       return base;
     },
     async rename_speaker(id,index,name){sample.speakers[String(index)]=name;return true;},
+    async merge_speakers(id,source,target){
+      const sourceKey=String(source),targetKey=String(target);
+      if(sourceKey===targetKey||!sample.speakers[sourceKey]||!sample.speakers[targetKey])return {ok:false,message:'说话人选择无效'};
+      previewSpeakerBackup=JSON.parse(JSON.stringify({speakers:sample.speakers,segments:sample.segments}));
+      let moved=0;
+      sample.segments.forEach(segment=>{if(String(segment.spk)===sourceKey){segment.spk=Number(targetKey);moved++;}});
+      delete sample.speakers[sourceKey];
+      return {ok:true,moved_segments:moved};
+    },
+    async delete_speaker(id,source){
+      const sourceKey=String(source);
+      if(Object.keys(sample.speakers).length<=1)return {ok:false,message:'文稿中至少保留一位说话人'};
+      if(!sample.speakers[sourceKey])return {ok:false,message:'说话人选择无效'};
+      previewSpeakerBackup=JSON.parse(JSON.stringify({speakers:sample.speakers,segments:sample.segments}));
+      const before=sample.segments.length;
+      sample.segments=sample.segments.filter(segment=>String(segment.spk)!==sourceKey);
+      delete sample.speakers[sourceKey];
+      return {ok:true,deleted_segments:before-sample.segments.length};
+    },
+    async undo_speaker_edit(){
+      if(!previewSpeakerBackup)return {ok:false,message:'没有可以撤销的说话人整理操作'};
+      sample.speakers={...previewSpeakerBackup.speakers};
+      sample.segments=previewSpeakerBackup.segments.map(segment=>({...segment}));
+      previewSpeakerBackup=null;
+      return {ok:true};
+    },
+    async undo_speaker_merge(){return this.undo_speaker_edit();},
     async rename_item(id,title){const row=items.find(x=>x.id===id);if(row)row.title=title;return true;},
     async bulk_delete_items(ids){items=items.filter(x=>!ids.includes(x.id));return {ok:true,count:ids.length};},
     async bulk_export_items(ids,format){return {ok:true,count:ids.length,directory:'~/Documents'};},

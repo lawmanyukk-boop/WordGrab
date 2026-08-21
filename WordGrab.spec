@@ -45,6 +45,10 @@ a = Analysis(
         'webview',
         'soundfile',
         'sounddevice',
+        'audio_pipeline',
+        'transcription_provider',
+        'job_state',
+        'system_audio',
         'numpy',
         'imageio_ffmpeg',
         'docx',
@@ -100,7 +104,9 @@ if sys.platform == 'darwin':
         icon='assets/icon.icns',
         bundle_identifier='com.local.wordgrab',
         info_plist={
-            'CFBundleShortVersionString': '1.3.2',
-            'CFBundleVersion': '1.3.2',
+            'CFBundleShortVersionString': '1.4.0',
+            'CFBundleVersion': '1.4.0',
+            'NSMicrophoneUsageDescription': 'WordGrab 需要使用麦克风进行本地实时录音和语音转写。',
+            'NSScreenCaptureUsageDescription': 'WordGrab 需要录制电脑播放的声音，用于本地会议转写。',
         },
     )

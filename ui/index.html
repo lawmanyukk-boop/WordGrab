@@ -14,7 +14,7 @@
     if (params.get('clean') === '1') document.documentElement.classList.add('clean-preview');
   })();
 </script>
-<link rel="stylesheet" href="/static/style.css?v=20260729-v131">
+<link rel="stylesheet" href="/static/style.css?v=20260812-speaker-delete">
 </head>
 <body>
 <div class="pywebview-drag-region app-drag-region" aria-hidden="true"></div>
@@ -143,7 +143,7 @@
 
           <aside class="inspector" aria-label="说话人与文件信息">
             <section class="inspector-section speaker-inspector">
-              <div class="inspector-title"><strong>说话人</strong><span>双击名称可改名</span></div>
+              <div class="inspector-title"><strong>说话人</strong><span>双击改名</span></div>
               <div id="speakerList" class="speaker-list"></div>
             </section>
             <section class="inspector-section file-inspector">
@@ -164,6 +164,7 @@
             <strong id="liveCaptionLabel">正在听</strong>
             <time id="liveCaptionTime">00:00</time>
             <span id="liveCaptionLag">字幕同步</span>
+            <span class="live-input-meter" aria-hidden="true"><i id="liveInputMeterFill"></i></span>
           </div>
           <p id="liveCaptionText">开始说话后，当前一句话会显示在这里</p>
         </div>
@@ -219,6 +220,18 @@
       </div>
     </div>
 
+    <!-- 后台导入任务：转写时仍可浏览、播放和编辑其他文稿 -->
+    <button id="backgroundImportBar" class="background-import-bar hidden" type="button" aria-label="查看后台转写进度">
+      <span class="background-import-dot" aria-hidden="true"></span>
+      <span class="background-import-copy">
+        <strong id="backgroundImportTitle">后台转写</strong>
+        <small id="backgroundImportStage">正在准备音频…</small>
+      </span>
+      <time id="backgroundImportElapsed">00:00</time>
+      <span id="backgroundImportEta" class="background-import-eta"></span>
+      <span class="background-import-return">查看进度 →</span>
+    </button>
+
     <!-- 进度遮罩 -->
     <div id="progress" class="progress hidden">
       <div class="progress-card">
@@ -227,6 +240,8 @@
         <div id="progStage" class="prog-stage"></div>
         <div class="prog-bar"><div id="progFill" class="prog-fill"></div></div>
         <div id="progElapsed" class="prog-elapsed"></div>
+        <button id="progressBackground" class="progress-background" type="button">后台处理，继续浏览</button>
+        <p class="progress-note">转写会继续在本机运行，完成后通知你</p>
       </div>
     </div>
   </main>
@@ -287,7 +302,37 @@
         </section>
 
         <section class="settings-page" data-settings-content="transcription">
-          <h3 class="setting-section-title first">转写</h3>
+          <h3 class="setting-section-title first">录音输入</h3>
+          <div class="setting-group">
+            <label class="setting-row">
+              <span><strong>录音来源</strong><small id="systemAudioHint">麦克风适合现场；电脑声音适合线上会议</small></span>
+              <select id="recordingSourceSelect" data-setting="recording_source">
+                <option value="microphone">仅麦克风</option>
+                <option value="both">麦克风＋电脑声音</option>
+                <option value="system">仅电脑声音</option>
+              </select>
+            </label>
+            <label class="setting-row">
+              <span><strong>麦克风</strong><small id="microphoneHint">选择用于实时录音的输入设备</small></span>
+              <select id="microphoneSelect" data-setting="preferred_mic_device"><option value="">系统默认麦克风</option></select>
+            </label>
+            <div class="setting-row microphone-test-row">
+              <span><strong>输入测试</strong><small id="microphoneLevelText">点击测试，然后说一句话</small></span>
+              <div class="microphone-test-control">
+                <div class="microphone-meter" aria-label="麦克风音量"><i id="microphoneMeterFill"></i><b id="microphonePeak"></b></div>
+                <button id="testMicrophoneBtn" class="setting-action" type="button">测试</button>
+              </div>
+            </div>
+            <label class="setting-row">
+              <span><strong>实时语音增强</strong><small>改善轻声输入并限制爆音；不会修改原始录音</small></span>
+              <span class="setting-switch"><input type="checkbox" data-setting="audio_enhancement"><i></i></span>
+            </label>
+            <label class="setting-row">
+              <span><strong>轻度环境降噪</strong><small>仅压低静音区间的稳定底噪，嘈杂环境可开启</small></span>
+              <span class="setting-switch"><input type="checkbox" data-setting="noise_reduction"><i></i></span>
+            </label>
+          </div>
+          <h3 class="setting-section-title">转写</h3>
           <div class="setting-group">
             <label class="setting-row">
               <span><strong>自动区分说话人</strong><small>关闭后所有内容按单一说话人整理</small></span>
@@ -359,7 +404,7 @@
             <label class="setting-row"><span><strong>默认分析模板</strong><small>生成时仍可临时切换</small></span><select id="aiDefaultTemplate"><option value="general">通用摘要</option></select></label>
             <div class="setting-row"><span><strong>自定义分析模板</strong><small id="aiTemplateCount">尚未创建自定义模板</small></span><button id="manageAiTemplates" class="setting-action" type="button">新建与管理</button></div>
           </div>
-          <div class="ai-setting-footer"><span id="aiConnectionStatus">尚未测试连接</span><div><button id="testAiConnection" class="setting-action" type="button">测试连接</button><button id="saveAiSettings" class="settings-done" type="button">保存设置</button></div></div>
+          <div class="ai-setting-footer"><span id="aiConnectionStatus" role="status" aria-live="polite" data-state="neutral">尚未测试连接</span><div><button id="testAiConnection" class="setting-action" type="button">测试连接</button><button id="saveAiSettings" class="settings-done" type="button">保存设置</button></div></div>
         </section>
 
         <section class="settings-page settings-theme-page" data-settings-content="themes">
@@ -488,6 +533,10 @@
   <button class="danger" type="button" role="menuitem" data-context-action="delete">删除文稿</button>
 </div>
 
+<div id="speakerContextMenu" class="context-menu hidden" role="menu" aria-label="说话人操作">
+  <button class="danger" type="button" role="menuitem" data-speaker-context-action="delete">删除说话人</button>
+</div>
+
 <div id="templateOverlay" class="confirm-overlay hidden">
   <section class="template-dialog" role="dialog" aria-modal="true" aria-labelledby="templateDialogTitle">
     <header><span><h2 id="templateDialogTitle">新建分析模板</h2><p>用自然语言告诉 AI 你想如何整理录音</p></span><button id="closeTemplateDialog" type="button" aria-label="关闭">×</button></header>
@@ -516,6 +565,17 @@
   </div>
 </div>
 
+<div id="speakerMergeOverlay" class="confirm-overlay hidden">
+  <div class="speaker-merge-dialog" role="dialog" aria-modal="true" aria-labelledby="speakerMergeTitle">
+    <p class="speaker-merge-eyebrow">整理当前文稿</p>
+    <h3 id="speakerMergeTitle">合并说话人</h3>
+    <p id="speakerMergeMessage"></p>
+    <label class="speaker-merge-field" for="speakerMergeTarget">合并到</label>
+    <select id="speakerMergeTarget" class="speaker-merge-select"></select>
+    <div class="speaker-merge-actions"><button id="speakerMergeCancel" type="button">取消</button><button id="speakerMergeAccept" class="primary" type="button">合并</button></div>
+  </div>
+</div>
+
 <div id="dropHint" class="drop-hint hidden">
   <div class="drop-hint-card">
     <img class="drop-hint-icon" src="/static/icon_1024.png" alt="">
@@ -525,6 +585,6 @@
 
 <audio id="audio"></audio>
 <div id="toast" class="toast"><span id="toastText"></span><button id="toastAction" type="button" class="hidden">撤销</button></div>
-  <script src="/static/app.js?v=20260729-model-audit"></script>
+  <script src="/static/app.js?v=20260812-speaker-delete"></script>
 </body>
 </html>

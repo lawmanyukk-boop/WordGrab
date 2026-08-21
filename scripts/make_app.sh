@@ -29,6 +29,26 @@ mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources"
 rm -f "$CONTENTS_DIR/MacOS/WordGrab-bin"
 cp "$PROJECT_ROOT/assets/icon.icns" "$CONTENTS_DIR/Resources/icon.icns"
 
+# ScreenCaptureKit helper streams computer audio as float32 PCM. Failure is
+# non-fatal: microphone-only recording remains fully available.
+SYSTEM_AUDIO_HELPER="$CONTENTS_DIR/Resources/system_audio_capture"
+SWIFT_CACHE_DIR="$(mktemp -d /tmp/wordgrab-swift-cache.XXXXXX)"
+if xcrun --sdk macosx swiftc \
+  -target "$(uname -m)-apple-macosx13.0" \
+  -module-cache-path "$SWIFT_CACHE_DIR" \
+  -O -parse-as-library \
+  -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia \
+  "$PROJECT_ROOT/native/system_audio_capture.swift" \
+  -o "$SYSTEM_AUDIO_HELPER"; then
+  chmod +x "$SYSTEM_AUDIO_HELPER"
+  codesign -f -s - "$SYSTEM_AUDIO_HELPER" 2>/dev/null || true
+  echo "系统音频组件构建完成"
+else
+  rm -f "$SYSTEM_AUDIO_HELPER"
+  echo "系统音频组件构建失败；麦克风录音不受影响" >&2
+fi
+rm -rf "$SWIFT_CACHE_DIR"
+
 cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -47,15 +67,17 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.3.2</string>
+    <string>1.4.0</string>
     <key>CFBundleVersion</key>
-    <string>1.3.2</string>
+    <string>1.4.0</string>
     <key>LSMinimumSystemVersion</key>
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>WordGrab 需要使用麦克风进行本地实时录音和语音转写。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>WordGrab 需要录制电脑播放的声音，用于本地会议转写。</string>
 </dict>
 </plist>
 PLIST
@@ -87,14 +109,18 @@ fi
 mkdir -p "$RUNTIME_ROOT/ui" "$RUNTIME_ROOT/assets"
 cp \
   "$PROJECT_ROOT/app.py" \
+  "$PROJECT_ROOT/audio_pipeline.py" \
   "$PROJECT_ROOT/ai_service.py" \
   "$PROJECT_ROOT/engine.py" \
+  "$PROJECT_ROOT/job_state.py" \
   "$PROJECT_ROOT/exporters.py" \
   "$PROJECT_ROOT/model_catalog.py" \
   "$PROJECT_ROOT/model_downloader.py" \
   "$PROJECT_ROOT/paths.py" \
   "$PROJECT_ROOT/store.py" \
+  "$PROJECT_ROOT/system_audio.py" \
   "$PROJECT_ROOT/transcribe.py" \
+  "$PROJECT_ROOT/transcription_provider.py" \
   "$PROJECT_ROOT/requirements.txt" \
   "$PROJECT_ROOT/README.md" \
   "$RUNTIME_ROOT/"
@@ -104,9 +130,10 @@ cp -R "$PROJECT_ROOT/assets/." "$RUNTIME_ROOT/assets/"
 # 在生成启动器前验证正式运行目录可以完整导入核心模块。这样新增模块或
 # 重构后的公开函数若未同步，构建会立即失败，不会留下一个打不开的 App。
 VALIDATION_PY="$RUNTIME_ROOT/.venv/bin/python"
+if [[ ! -x "$VALIDATION_PY" ]]; then VALIDATION_PY="$PY_SOURCE"; fi
 if [[ -x "$VALIDATION_PY" ]]; then
   PYTHONPATH="$RUNTIME_ROOT" "$VALIDATION_PY" -c \
-    'import app; assert callable(app.make_speaker_colors); assert callable(app.recover_interrupted_recordings)'
+    'import app, audio_pipeline, job_state, system_audio, transcription_provider; assert callable(app.make_speaker_colors); assert callable(app.recover_interrupted_recordings)'
   echo "运行模块自检通过"
 fi
 
@@ -117,14 +144,17 @@ DIR="\$(cd "\$(dirname "\$0")" && pwd)"
 PROJECT_ROOT="\$HOME/Library/Application Support/WordGrab"
 cd "\$PROJECT_ROOT" || exit 1
 export MODELSCOPE_CACHE="\$HOME/.cache/modelscope"
+export WORDGRAB_SYSTEM_AUDIO_HELPER="$SYSTEM_AUDIO_HELPER"
 mkdir -p "\$PROJECT_ROOT/data"
 
 PYTHON="\$DIR/WordGrab-bin"
 VENV_SITE="\$(find "\$PROJECT_ROOT/.venv/lib" -maxdepth 2 -type d -name site-packages 2>/dev/null | head -1)"
 # 优先使用 App 包内的可执行文件，确保 macOS 将进程识别为 WordGrab；
 # 依赖仍从完整虚拟环境读取，不影响转写与 AI 功能。
-if [[ -x "\$PYTHON" && -n "\$VENV_SITE" ]]; then
-  export PYTHONPATH="\$VENV_SITE\${PYTHONPATH:+:\$PYTHONPATH}"
+if [[ -x "\$PYTHON" ]]; then
+  if [[ -n "\$VENV_SITE" ]]; then
+    export PYTHONPATH="\$VENV_SITE\${PYTHONPATH:+:\$PYTHONPATH}"
+  fi
 else
   PYTHON="\$PROJECT_ROOT/.venv/bin/python"
 fi
