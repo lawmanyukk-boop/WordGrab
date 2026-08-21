@@ -67,11 +67,19 @@ _STREAM_MODEL_LOCK = threading.Lock()
 # 小矩阵为主，线程过多会增加调度争抢，因此这里不是“线程越多越快”。
 STREAMING_DEVICE = "cpu"
 STREAMING_NCPU = 2
-STREAMING_CHUNK_SECONDS = 1.2
-# 在线 Paraformer 在连续讲话时通常要等 is_final 才给出稳定文字。15 秒才
-# 强制结句会让用户误以为实时字幕失效；4.8 秒能在可读性和响应速度间平衡。
-LIVE_UTTERANCE_MAX_SECONDS = 4.8
-LIVE_SILENCE_END_SECONDS = 0.65
+# ParaformerStreaming 的 [0, 10, 5] 配置规定每次输入 600ms。传入 1.2 秒
+# 会让流式缓存跨过一个步长，既延迟上屏，也会降低低音量语音的稳定性。
+STREAMING_CHUNK_SECONDS = 0.6
+# 字幕每 600ms 仍会更新；这里仅控制何时把当前字幕归档为文稿段落。
+# 稍长上下文能减少短词和语气词误识别，同时不会增加实时字幕延迟。
+LIVE_UTTERANCE_MAX_SECONDS = 6.0
+LIVE_SILENCE_END_SECONDS = 0.8
+LIVE_INITIAL_NOISE_RMS = 0.0008
+LIVE_MIN_SILENCE_RMS = 0.0006
+LIVE_MAX_SILENCE_RMS = 0.003
+LIVE_TARGET_RMS = 0.04
+LIVE_MAX_GAIN = 8.0
+LIVE_FILLER_WORDS = {"嗯", "嗯嗯", "呃", "额", "啊"}
 
 
 REQUIRED_FUNASR_COMPONENTS = {
@@ -332,6 +340,62 @@ def live_caption_tail(text, limit=64):
     if 0 < first_space < 24:
         tail = tail[first_space + 1:]
     return "…" + tail.lstrip()
+
+
+def update_live_noise_floor(noise_floor, rms):
+    """跟踪麦克风底噪；只让估计值缓慢上升，避免把轻声讲话当成静音。"""
+    noise_floor = max(float(noise_floor or LIVE_INITIAL_NOISE_RMS), 1e-6)
+    rms = max(float(rms or 0.0), 0.0)
+    if rms <= noise_floor * 2.5:
+        rate = 0.18 if rms < noise_floor else 0.025
+        noise_floor += (rms - noise_floor) * rate
+    return max(1e-6, noise_floor)
+
+
+def live_silence_threshold(noise_floor):
+    """根据底噪生成静音阈值，并限制在适合常见麦克风的安全范围。"""
+    return min(
+        LIVE_MAX_SILENCE_RMS,
+        max(LIVE_MIN_SILENCE_RMS, float(noise_floor) * 2.2),
+    )
+
+
+def normalize_live_audio(samples):
+    """温和提升偏小的实时输入；保留静音，不让底噪被放大成语音。"""
+    import numpy as np
+
+    audio = np.asarray(samples, dtype="float32")
+    if not audio.size:
+        return audio, 1.0
+    rms = float(np.sqrt(np.mean(np.square(audio))))
+    peak = float(np.max(np.abs(audio)))
+    if rms < LIVE_MIN_SILENCE_RMS or peak <= 0:
+        return audio, 1.0
+    gain = min(LIVE_MAX_GAIN, LIVE_TARGET_RMS / max(rms, 1e-8))
+    gain = max(1.0, gain)
+    if gain <= 1.01:
+        return audio, 1.0
+    # 麦克风偶发的敲击尖峰不应限制整段增益；少量软限幅比让整句保持
+    # 在 -45dBFS 更利于识别，同时保证输入始终位于 float 音频范围内。
+    boosted = np.tanh(audio * gain).astype("float32", copy=False)
+    return np.ascontiguousarray(boosted), float(gain)
+
+
+def is_repeated_live_filler(previous_segments, text):
+    """抑制连续重复的单独语气词，保留第一次和包含实际内容的句子。"""
+    text = str(text or "").strip(" ，。！？、,.!?\t\r\n")
+    if text not in LIVE_FILLER_WORDS or not previous_segments:
+        return False
+    previous = str(previous_segments[-1].get("text") or "").strip(
+        " ，。！？、,.!?\t\r\n"
+    )
+    return previous == text
+
+
+def is_live_filler(text):
+    """判断一条结果是否只有没有上下文的语气词。"""
+    normalized = str(text or "").strip(" ，。！？、,.!?\t\r\n")
+    return normalized in LIVE_FILLER_WORDS
 
 
 def should_finalize_live_utterance(silence_seconds, utterance_seconds):
